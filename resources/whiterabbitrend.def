@@ -1,0 +1,14 @@
+LIBRARY whiterabbitrend
+EXPORTS
+	GetRefAPI
+	timeBeginPeriod
+    timeEndPeriod
+    timeGetTime
+    joyGetDevCapsA
+    joyGetNumDevs
+    joyGetPosEx
+    midiInClose
+    midiInGetDevCapsA
+    midiInGetNumDevs
+    midiInOpen
+    midiInStart

@@ -1,0 +1,76 @@
+
+Dump of file D:\AMG-A1\Base\cgamex86.dll
+
+File Type: DLL
+
+  Section contains the following exports for cgamex86.dll
+
+    00000000 characteristics
+    3A10C8BA time date stamp Tue Nov 14 07:08:10 2000
+        0.00 version
+           1 ordinal base
+          53 number of functions
+          53 number of names
+
+    ordinal hint RVA      name
+
+          1    0 00007C60 ??0str@@QAE@ABV0@@Z
+          2    1 00007D80 ??0str@@QAE@D@Z
+          3    2 00007E40 ??0str@@QAE@H@Z
+          4    3 00008350 ??0str@@QAE@I@Z
+          5    4 00007DC0 ??0str@@QAE@M@Z
+          6    5 00007BE0 ??0str@@QAE@PBD@Z
+          7    6 00007C80 ??0str@@QAE@V0@HH@Z
+          8    7 00007BC0 ??0str@@QAE@XZ
+          9    8 00007B80 ??1str@@QAE@XZ
+         10    9 000084F0 ??4str@@QAEXABV0@@Z
+         11    A 00008550 ??4str@@QAEXPBD@Z
+         12    B 000084C0 ??Astr@@QAEAADH@Z
+         13    C 00007B50 ??Astr@@QBEDH@Z
+         14    D 00009170 ??Bstr@@QBEPBDXZ
+         15    E 00008E10 ??Ystr@@QAEAAV0@ABV0@@Z
+         16    F 00008F00 ??Ystr@@QAEAAV0@D@Z
+         17   10 0003A5A0 ??Ystr@@QAEAAV0@H@Z
+         18   11 0003A640 ??Ystr@@QAEAAV0@I@Z
+         19   12 0003A500 ??Ystr@@QAEAAV0@M@Z
+         20   13 00008E80 ??Ystr@@QAEAAV0@PBD@Z
+         21   14 00008F90 ??Ystr@@QAEAAV0@_N@Z
+         22   15 00052500 ??_C@_02MECO@?$CFd?$AA@
+         23   16 00052510 ??_C@_02MHMJ@?$CFu?$AA@
+         24   17 000524F8 ??_C@_04KIBJ@?$CF?43f?$AA@
+         25   18 0003A880 ?BackSlashesToSlashes@str@@QAEXXZ
+         26   19 0003A6E0 ?CapLength@str@@QAEXH@Z
+         27   1A 0003A7B0 ?EnsureAlloced@str@@IAEXH_N@Z
+         28   1B 0003A720 ?EnsureDataWritable@str@@IAEXXZ
+         29   1C 00008450 ?append@str@@QAEXABV1@@Z
+         30   1D 000083E0 ?append@str@@QAEXPBD@Z
+         31   1E 000083D0 ?c_str@str@@QBEPBDXZ
+         32   1F 000090C0 ?cmp@str@@QBEHABV1@@Z
+         33   20 000090A0 ?cmp@str@@QBEHPBD@Z
+         34   21 0003A0D0 ?cmp@str@@SAHPBD0@Z
+         35   22 00009100 ?cmpn@str@@QBEHABV1@H@Z
+         36   23 000090E0 ?cmpn@str@@QBEHPBDH@Z
+         37   24 0003A080 ?cmpn@str@@SAHPBD0H@Z
+         38   25 0005FE8C ?dummy@?1???Astr@@QAEAADH@Z@4DA
+         39   26 00009080 ?icmp@str@@QBEHABV1@@Z
+         40   27 00009060 ?icmp@str@@QBEHPBD@Z
+         41   28 0003A030 ?icmp@str@@SAHPBD0@Z
+         42   29 00009040 ?icmpn@str@@QBEHABV1@H@Z
+         43   2A 00009020 ?icmpn@str@@QBEHPBDH@Z
+         44   2B 00039FC0 ?icmpn@str@@SAHPBD0H@Z
+         45   2C 00009160 ?isNumeric@str@@QBE_NXZ
+         46   2D 0003A110 ?isNumeric@str@@SA_NPBD@Z
+         47   2E 00007B70 ?length@str@@QBEHXZ
+         48   2F 0003A8B0 ?snprintf@str@@SAXPADHPBDZZ
+         49   30 00009120 ?tolower@str@@QAEXXZ
+         50   31 00039F60 ?tolower@str@@SAPADPAD@Z
+         51   32 00009140 ?toupper@str@@QAEXXZ
+         52   33 00039F90 ?toupper@str@@SAPADPAD@Z
+         53   34 000241B0 GetCGameAPI
+
+  Summary
+
+      40C000 .data
+        4000 .rdata
+        8000 .reloc
+       4D000 .text

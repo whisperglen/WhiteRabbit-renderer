@@ -1,0 +1,58 @@
+          1    0 00005DE0 ??0str@@QAE@ABV0@@Z
+          2    1 000061B0 ??0str@@QAE@D@Z
+          3    2 000064D0 ??0str@@QAE@H@Z
+          4    3 00006700 ??0str@@QAE@I@Z
+          5    4 000061F0 ??0str@@QAE@M@Z
+          6    5 00005A90 ??0str@@QAE@PBD@Z
+          7    6 00005E00 ??0str@@QAE@V0@HH@Z
+          8    7 00005930 ??0str@@QAE@XZ
+          9    8 00005840 ??1str@@QAE@XZ
+         10    9 00006DF0 ??4str@@QAEXABV0@@Z
+         11    A 00006E50 ??4str@@QAEXPBD@Z
+         12    B 00006BB0 ??Astr@@QAEAADH@Z
+         13    C 000056B0 ??Astr@@QBEDH@Z
+         14    D 00007BB0 ??Bstr@@QBEPBDXZ
+         15    E 000075A0 ??Ystr@@QAEAAV0@ABV0@@Z
+         16    F 00007690 ??Ystr@@QAEAAV0@D@Z
+         17   10 00050180 ??Ystr@@QAEAAV0@H@Z
+         18   11 00050220 ??Ystr@@QAEAAV0@I@Z
+         19   12 000500E0 ??Ystr@@QAEAAV0@M@Z
+         20   13 00007610 ??Ystr@@QAEAAV0@PBD@Z
+         21   14 00007720 ??Ystr@@QAEAAV0@_N@Z
+         22   15 0010B5F8 ??_C@_02MECO@?$CFd?$AA@
+         23   16 0010B5FC ??_C@_02MHMJ@?$CFu?$AA@
+         24   17 0010B5F0 ??_C@_04KIBJ@?$CF?43f?$AA@
+         25   18 00050460 ?BackSlashesToSlashes@str@@QAEXXZ
+         26   19 000502C0 ?CapLength@str@@QAEXH@Z
+         27   1A 00050390 ?EnsureAlloced@str@@IAEXH_N@Z
+         28   1B 00050300 ?EnsureDataWritable@str@@IAEXXZ
+         29   1C 000069E0 ?append@str@@QAEXABV1@@Z
+         30   1D 000068C0 ?append@str@@QAEXPBD@Z
+         31   1E 00006800 ?c_str@str@@QBEPBDXZ
+         32   1F 00007B00 ?cmp@str@@QBEHABV1@@Z
+         33   20 00007AE0 ?cmp@str@@QBEHPBD@Z
+         34   21 0004FCB0 ?cmp@str@@SAHPBD0@Z
+         35   22 00007B40 ?cmpn@str@@QBEHABV1@H@Z
+         36   23 00007B20 ?cmpn@str@@QBEHPBDH@Z
+         37   24 0004FC60 ?cmpn@str@@SAHPBD0H@Z
+         38   25 0012FEC4 ?dummy@?1???Astr@@QAEAADH@Z@4DA
+         39   26 000079F0 ?icmp@str@@QBEHABV1@@Z
+         40   27 000079D0 ?icmp@str@@QBEHPBD@Z
+         41   28 0004FC10 ?icmp@str@@SAHPBD0@Z
+         42   29 000079B0 ?icmpn@str@@QBEHABV1@H@Z
+         43   2A 00007990 ?icmpn@str@@QBEHPBDH@Z
+         44   2B 0004FBA0 ?icmpn@str@@SAHPBD0H@Z
+         45   2C 00007BA0 ?isNumeric@str@@QBE_NXZ
+         46   2D 0004FCF0 ?isNumeric@str@@SA_NPBD@Z
+         47   2E 00005780 ?length@str@@QBEHXZ
+         48   2F 00050490 ?snprintf@str@@SAXPADHPBDZZ
+         49   30 00007B60 ?tolower@str@@QAEXXZ
+         50   31 0004FB40 ?tolower@str@@SAPADPAD@Z
+         51   32 00007B80 ?toupper@str@@QAEXXZ
+         52   33 0004FB70 ?toupper@str@@SAPADPAD@Z
+         53   34 00000000 
+         54   35 00000000 
+         55   36 00000000 
+         56   37 00000000 
+         57   38 00000000 
+         58   39 00000000 

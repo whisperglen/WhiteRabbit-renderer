@@ -1,0 +1,60 @@
+LIBRARY mainbin
+EXPORTS
+ ??0str@@QAE@ABV0@@Z
+ ??0str@@QAE@D@Z
+ ??0str@@QAE@H@Z
+ ??0str@@QAE@I@Z
+ ??0str@@QAE@M@Z
+ ??0str@@QAE@PBD@Z
+ ??0str@@QAE@V0@HH@Z
+ ??0str@@QAE@XZ
+ ??1str@@QAE@XZ
+ ??4str@@QAEXABV0@@Z
+ ??4str@@QAEXPBD@Z
+ ??Astr@@QAEAADH@Z
+ ??Astr@@QBEDH@Z
+ ??Bstr@@QBEPBDXZ
+ ??Ystr@@QAEAAV0@ABV0@@Z
+ ??Ystr@@QAEAAV0@D@Z
+ ??Ystr@@QAEAAV0@H@Z
+ ??Ystr@@QAEAAV0@I@Z
+ ??Ystr@@QAEAAV0@M@Z
+ ??Ystr@@QAEAAV0@PBD@Z
+ ??Ystr@@QAEAAV0@_N@Z
+ ??_C@_02MECO@?$CFd?$AA@
+ ??_C@_02MHMJ@?$CFu?$AA@
+ ??_C@_04KIBJ@?$CF?43f?$AA@
+ ?BackSlashesToSlashes@str@@QAEXXZ
+ ?CapLength@str@@QAEXH@Z
+ ?EnsureAlloced@str@@IAEXH_N@Z
+ ?EnsureDataWritable@str@@IAEXXZ
+ ?append@str@@QAEXABV1@@Z
+ ?append@str@@QAEXPBD@Z
+ ?c_str@str@@QBEPBDXZ
+ ?cmp@str@@QBEHABV1@@Z
+ ?cmp@str@@QBEHPBD@Z
+ ?cmp@str@@SAHPBD0@Z
+ ?cmpn@str@@QBEHABV1@H@Z
+ ?cmpn@str@@QBEHPBDH@Z
+ ?cmpn@str@@SAHPBD0H@Z
+ ?dummy@?1???Astr@@QAEAADH@Z@4DA
+ ?icmp@str@@QBEHABV1@@Z
+ ?icmp@str@@QBEHPBD@Z
+ ?icmp@str@@SAHPBD0@Z
+ ?icmpn@str@@QBEHABV1@H@Z
+ ?icmpn@str@@QBEHPBDH@Z
+ ?icmpn@str@@SAHPBD0H@Z
+ ?isNumeric@str@@QBE_NXZ
+ ?isNumeric@str@@SA_NPBD@Z
+ ?length@str@@QBEHXZ
+ ?snprintf@str@@SAXPADHPBDZZ
+ ?tolower@str@@QAEXXZ
+ ?tolower@str@@SAPADPAD@Z
+ ?toupper@str@@QAEXXZ
+ ?toupper@str@@SAPADPAD@Z
+ 
+ 
+ 
+ 
+ 
+ 
