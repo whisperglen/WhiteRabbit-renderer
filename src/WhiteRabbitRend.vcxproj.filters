@@ -32,9 +32,6 @@
     <ClCompile Include="globals.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="winmm_proxy.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="str.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -46,5 +43,10 @@
     <ClInclude Include="str.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="symbols.asm">
+      <Filter>Source Files</Filter>
+    </MASM>
   </ItemGroup>
 </Project>

@@ -722,6 +722,6 @@ int CM_MarkFragments( int orientation, const vec3_t* points, const vec3_t projec
 	return R_MarkFragments(orientation, points, projection, maxPoints, pointBuffer, maxFragments, fragmentBuffer);
 }
 
-int g_eLanguage = 0; //english //0x7cf868 //FUN_004d60e0 gets called right after this is set
-vec4_t g_color_table = { 1.0f, 1.0f, 1.0f, 1.0f };
-int g_wv[2] = { 0, 0 };
+//int g_eLanguage = 0; //english //0x7cf868 //FUN_004d60e0 gets called right after this is set
+//vec4_t g_color_table = { 1.0f, 1.0f, 1.0f, 1.0f };
+//int g_wv[2] = { 0, 0 };
