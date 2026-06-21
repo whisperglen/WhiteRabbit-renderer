@@ -158,38 +158,11 @@ size_t QDECL Com_sprintf( char *dest, size_t size, const char *fmt, ...) {
 	return len;
 }
 
-void COM_StripExtension( const char *in, char *out, int destsize ) {
-	size_t length;
-
-	Q_strncpyz(out, in, destsize);
-
-	length = strlen(out)-1;
-	while (length > 0 && out[length] != '.')
-	{
-		length--;
-		if (out[length] == '/')
-			return;		// no extension
+void COM_StripExtension(const char* in, char* out) {
+	while (*in && *in != '.') {
+		*out++ = *in++;
 	}
-	if (length)
-		out[length] = 0;
-}
-
-qboolean SkipBracedSection (char **program, int depth) {
-	char			*token;
-
-	do {
-		token = COM_ParseExt( program, qtrue );
-		if( token[1] == 0 ) {
-			if( token[0] == '{' ) {
-				depth++;
-			}
-			else if( token[0] == '}' ) {
-				depth--;
-			}
-		}
-	} while( depth && *program );
-
-	return ( depth == 0 );
+	*out = 0;
 }
 
 ID_INLINE float Q_rsqrt(float number)
