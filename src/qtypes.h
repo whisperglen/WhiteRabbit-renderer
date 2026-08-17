@@ -1,7 +1,6 @@
 
 #ifndef _QTYPES_H
 #define _QTYPES_H
-#endif
 
 #include <stdint.h>
 
@@ -123,3 +122,5 @@ size_t QDECL Com_sprintf( char* dest, size_t size, const char* fmt, ... );
 #ifdef __cplusplus
 }
 #endif
+
+#endif // _QTYPES_H

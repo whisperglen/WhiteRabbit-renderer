@@ -11,19 +11,9 @@
 #include <time.h>
 #include <Windows.h>
 #include "qtypes.h"
+#include "alice_renderer_api.h"
 
-#define RI_PRINTF_OFF 0
-#define RI_ERROR_OFF 1
-#define RI_MILLIS_OFF 2
-#define RI_TIKI_GETANIM_OFF 27
-typedef void	(QDECL *ri_Printf)( int printLevel, const char *fmt, ...);
-typedef void	(QDECL *ri_Error)( int errorLevel, const char *fmt, ...);
-typedef int		(*ri_Milliseconds)( void );
-typedef void* (*ri_TIKI_GetAnim)( int index );
-
-extern intptr_t ri;
-//sizeof(ri) = 0x27
-static intptr_t *ri_dp = &ri;
+extern refimport_t ri;
 
 // can't just use function pointers, or dll linkage can
 // mess up when qcommon is included in multiple places
@@ -133,7 +123,7 @@ void QDECL Com_Printf( const char *msg, ... )
     va_end(argptr);
 
     //ri.Printf(PRINT_ALL, "%s", text);
-    ((ri_Printf)ri_dp[RI_PRINTF_OFF] )(PRINT_ALL, "%s", text);
+    ri.Printf(PRINT_ALL, "%s", text);
 }
 
 void QDECL Com_DPrintf( const char *msg, ... )
@@ -146,7 +136,7 @@ void QDECL Com_DPrintf( const char *msg, ... )
     va_end(argptr);
 
     //ri.Printf(PRINT_DEVELOPER, "%s", text);
-    ((ri_Printf)ri_dp[RI_PRINTF_OFF])(PRINT_DEVELOPER, "%s", text);
+    ri.Printf(PRINT_DEVELOPER, "%s", text);
 }
 
 void QDECL Com_Error( int level, const char *error, ... )
@@ -159,7 +149,7 @@ void QDECL Com_Error( int level, const char *error, ... )
     va_end(argptr);
 
     //ri.Error(level, "%s", text);
-    ((ri_Error)ri_dp[RI_ERROR_OFF])(level, "%s", text);
+    ri.Error(level, "%s", text);
 }
 
 //int sys_timeBase;
@@ -180,7 +170,7 @@ void QDECL Com_Error( int level, const char *error, ... )
 
 int Sys_Milliseconds (void)
 {
-    return ((ri_Milliseconds)ri_dp[RI_MILLIS_OFF])();
+    return ri.Milliseconds();
 }
 
 #define	MAX_QPATH			256		// max length of a quake game pathname
@@ -264,7 +254,7 @@ void *TIKI_GetAnim(int index)
 {
     //return skelcache[index].skel;
     //return ri.TIKI_GetAnim( index );
-    return ((ri_TIKI_GetAnim)ri_dp[RI_TIKI_GETANIM_OFF])(index);
+    return ri.TIKI_GetAnim(index);
 }
 
 void IN_ChangeResolution()
