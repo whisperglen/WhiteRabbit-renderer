@@ -35,12 +35,18 @@
     <ClCompile Include="str.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="win_glimp.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="qtypes.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="str.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="alice_renderer_api.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

@@ -14,6 +14,7 @@
 #include "alice_renderer_api.h"
 
 extern refimport_t ri;
+extern void QDECL RendererLogPrintf(const char* fmt, ...);
 
 // can't just use function pointers, or dll linkage can
 // mess up when qcommon is included in multiple places
@@ -247,14 +248,15 @@ void ChopWindingInPlace( winding_t** inout, vec3_t normal, vec_t dist, vec_t eps
 void *TIKI_GetSkel(int index)
 {
     const void *fp = (void*)0x431ea0;
-    return ((void* (*)(int))fp)(index);
+    void *result = ((void* (*)(int))fp)(index);
+
+    return result;
 }
 
 void *TIKI_GetAnim(int index)
 {
-    //return skelcache[index].skel;
-    //return ri.TIKI_GetAnim( index );
-    return ri.TIKI_GetAnim(index);
+    void *result = ri.TIKI_GetAnim(index);
+    return result;
 }
 
 void IN_ChangeResolution()
