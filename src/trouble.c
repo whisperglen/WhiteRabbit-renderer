@@ -22,15 +22,22 @@ static short ( *_BigShort )( short l );
 static short ( *_LittleShort )( short l );
 static int ( *_BigLong )( int l );
 static int ( *_LittleLong )( int l );
-static float ( *_BigFloat )( float l );
-static float ( *_LittleFloat )( float l );
+/*
+ * Alice's renderer.lib uses the older id Tech float-endian ABI: the
+ * float is passed by address.  This is significant on x86 because the
+ * C linker decorates both the old and a by-value prototype as _LittleFloat,
+ * so a mismatched shim links successfully but turns each input pointer into
+ * a tiny floating point position.
+ */
+static float ( *_BigFloat )( const float *l );
+static float ( *_LittleFloat )( const float *l );
 
 short   BigShort( short l ) {return _BigShort( l );}
 short   LittleShort( short l ) {return _LittleShort( l );}
 int     BigLong( int l ) {return _BigLong( l );}
 int     LittleLong( int l ) {return _LittleLong( l );}
-float   BigFloat( float l ) {return _BigFloat( l );}
-float   LittleFloat( float l ) {return _LittleFloat( l );}
+float   BigFloat( const float *l ) {return _BigFloat( l );}
+float   LittleFloat(const float *l) {return _LittleFloat( l );}
 
 short   ShortSwap( short l ) {
     byte b1,b2;
@@ -60,7 +67,7 @@ int LongNoSwap( int l ) {
     return l;
 }
 
-float FloatSwap( float f ) {
+float FloatSwap( const float *f ) {
     union
     {
         float f;
@@ -68,7 +75,7 @@ float FloatSwap( float f ) {
     } dat1, dat2;
 
 
-    dat1.f = f;
+    dat1.f = *f;
     dat2.b[0] = dat1.b[3];
     dat2.b[1] = dat1.b[2];
     dat2.b[2] = dat1.b[1];
@@ -76,8 +83,8 @@ float FloatSwap( float f ) {
     return dat2.f;
 }
 
-float FloatNoSwap( float f ) {
-    return f;
+float FloatNoSwap( const float *f ) {
+    return *f;
 }
 
 uint32_t bigendian = 0;

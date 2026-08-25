@@ -98,7 +98,8 @@ typedef struct refimport_s
     char* (QDECL *Cmd_Argv)(int index);                                             /* 14 */
     void (QDECL *Cmd_ExecuteText)(int when, const char* text);                      /* 15 */
     void (QDECL *CM_DrawDebugSurface)(void (QDECL *drawPoly)(int, int, float*));    /* 16 */
-    int  (QDECL *FS_FOpenFileRead)(const char* name, fileHandle_t* file, qboolean unique); /* 17 */
+    int  (QDECL *FS_FOpenFileRead)(const char* name, fileHandle_t* file,
+                                   qboolean unique, int flags);                     /* 17 */
     int  (QDECL *FS_Read)(void* buffer, int length, fileHandle_t file);             /* 18 */
     void (QDECL *FS_FCloseFile)(fileHandle_t file);                                 /* 19 */
     int  (QDECL *FS_Seek)(fileHandle_t file, long offset, int origin);              /* 20 */
