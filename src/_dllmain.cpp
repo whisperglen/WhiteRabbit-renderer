@@ -5,17 +5,43 @@
 #include <stdint.h>
 #include <time.h>
 #include <string.h>
+#include <intrin.h>
 #include <detours.h>
+#include "alice_renderer_api.h"
 
-extern "C" void* GetRefAPI();
+extern "C" void* __cdecl GetRefAPI(int apiVersion, void* imports);
 extern "C" void GLW_GetValidModes();
 extern "C" void GLW_GetValidModes_Override();
+extern "C" void RB_StageIteratorSky();
+extern "C" void R_Sky_Reset();
+extern "C" void R_Sky_AddSurf();
+extern "C" void R_Sky_Render();
+extern "C" int SurfIsOffscreen();
+extern "C" void RendererInitSkyPortalOptions(void);
+
+extern "C" refimport_t ri;
 
 static void logInit();
 static void logClose();
 extern "C" void RendererLogPrintf(const char* fmt, ...);
 int hook_unprotect(void* ptr, int size, unsigned long* restore);
 int hook_protect(void* ptr, int size, unsigned long restore);
+
+/*
+ * Keep the renderer's original GetRefAPI as the call target, but interpose the
+ * import table immediately afterwards.  This lets the BSP read probe observe
+ * the exact bytes that the renderer later gives to ParseFace.
+ */
+typedef void* (__cdecl *GetRefAPIFn)(int apiVersion, void* imports);
+static GetRefAPIFn s_originalGetRefAPI = GetRefAPI;
+
+static void* __cdecl GetRefAPI_ImportTraceHook(int apiVersion, void* imports)
+{
+    void* exports = s_originalGetRefAPI(apiVersion, imports);
+    /* Created after the import table becomes valid; see sky portal hook. */
+    RendererInitSkyPortalOptions();
+    return exports;
+}
 
 /*
  * The remaster only recognizes ` and ~ as console keys. VorpalFix solves
@@ -143,6 +169,120 @@ static void uninstall_console_fix()
     }
 }
 
+/*
+ * Ritual's sky portal is independent of RB_StageIteratorSky.  A world sky
+ * surface is redirected to R_Sky_AddSurf, then R_Sky_Render creates the
+ * portal view only if at least one collected surface is on screen.  Counting
+ * those hand-offs identifies the exact early-out without guessing at the
+ * private tr.portalsky layout.
+ */
+typedef void (__cdecl *RSkyResetFn)();
+typedef void (__cdecl *RSkyAddSurfFn)(void* surface);
+typedef void (__cdecl *RSkyRenderFn)();
+typedef int (__cdecl *SurfIsOffscreenFn)(const void* surface, void* shader,
+                                         int entityNum);
+/* cvar_t::integer is at 0x20 in Alice's 32-bit game ABI. */
+typedef struct renderer_cvar_s {
+    byte reserved[0x20];
+    int integer;
+} renderer_cvar_t;
+
+static RSkyResetFn s_originalRSkyReset = R_Sky_Reset;
+static RSkyAddSurfFn s_originalRSkyAddSurf = (RSkyAddSurfFn)R_Sky_AddSurf;
+static RSkyRenderFn s_originalRSkyRender = R_Sky_Render;
+static SurfIsOffscreenFn s_originalSurfIsOffscreen =
+    (SurfIsOffscreenFn)SurfIsOffscreen;
+static const uintptr_t s_rSkyRenderAddress = (uintptr_t)R_Sky_Render;
+static bool s_skyPortalTraceHooked = false;
+static unsigned int s_skyPortalSurfaceCount = 0;
+static int s_lastSkyPortalSurfaceCount = -1;
+static int s_lastSkyPortalReportTime = -0x3fffffff;
+static unsigned int s_skyRenderDepth = 0;
+static bool s_skyPortalViewInvoked = false;
+static bool s_insideSkyPortalRender = false;
+static renderer_cvar_t* s_forceSkyPortal = nullptr;
+static unsigned int s_forcedSkyPortalTraceCount = 0;
+
+extern "C" void RendererInitSkyPortalOptions(void)
+{
+    if (!s_forceSkyPortal && ri.Cvar_Get)
+    {
+        s_forceSkyPortal = (renderer_cvar_t*)ri.Cvar_Get(
+            "r_forceSkyPortal", "1", 1 /* CVAR_ARCHIVE */);
+        RendererLogPrintf("r_forceSkyPortal initialized to %d\n",
+                          s_forceSkyPortal ? s_forceSkyPortal->integer : -1);
+    }
+}
+
+static int __cdecl SurfIsOffscreen_SkyPortalHook(const void* surface,
+                                                 void* shader, int entityNum)
+{
+    const int originalResult = s_originalSurfIsOffscreen(surface, shader, entityNum);
+
+    /*
+     * R_Sky_Render uses ENTITYNUM_WORLD (1022) solely as a gate before it
+     * launches its separate sky-portal view.  Forcing only this call preserves
+     * all normal mirror/portal culling and still lets Alice render the genuine
+     * portal world from its authored sky origin.
+     */
+    const uintptr_t caller = (uintptr_t)_ReturnAddress();
+    const bool calledBySkyPortalGate =
+        caller >= s_rSkyRenderAddress && caller < s_rSkyRenderAddress + 0x1000;
+
+    if (calledBySkyPortalGate && s_forceSkyPortal && s_forceSkyPortal->integer &&
+        entityNum == 1022)
+    {
+        return 0;
+    }
+
+    return originalResult;
+}
+
+static void install_sky_portal_trace()
+{
+    LONG status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalSurfIsOffscreen,
+                              SurfIsOffscreen_SkyPortalHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_skyPortalTraceHooked = true;
+        RendererLogPrintf("Sky portal trace installed\n");
+    }
+    else
+        RendererLogPrintf("WARN: failed to install sky portal trace: %ld\n", status);
+}
+
+static void uninstall_sky_portal_trace()
+{
+    LONG status;
+
+    if (!s_skyPortalTraceHooked)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalSurfIsOffscreen,
+                              SurfIsOffscreen_SkyPortalHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove sky portal trace: %ld\n", status);
+    s_skyPortalTraceHooked = false;
+}
+
 int hook_unprotect(void* ptr, int size, unsigned long* restore)
 {
     DWORD error;
@@ -179,7 +319,7 @@ static void install_getrefapi()
         intptr_t fnoff = 0x000650f6;
         if (!memcmp(&code[1], &fnoff, sizeof(fnoff)))
         {
-            fnoff = (intptr_t)GetRefAPI - (intptr_t)(&code[5]);
+            fnoff = (intptr_t)GetRefAPI_ImportTraceHook - (intptr_t)(&code[5]);
 
             unsigned long restore;
             if (hook_unprotect(code, 5, &restore))
@@ -299,12 +439,14 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         DisableThreadLibraryCalls(hModule);
         logInit();
         install_console_fix();
+        install_sky_portal_trace();
         install_glw_getvalidmodes();
         install_getrefapi();
         break;
     case DLL_PROCESS_DETACH:
         uninstall_glw_getvalidmodes();
         uninstall_getrefapi();
+        uninstall_sky_portal_trace();
         uninstall_console_fix();
         logClose();
         break;
