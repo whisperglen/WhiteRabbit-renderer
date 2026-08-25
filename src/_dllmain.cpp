@@ -9,6 +9,8 @@
 #include <detours.h>
 #include "alice_renderer_api.h"
 
+extern "C" refimport_t ri;
+
 extern "C" void* __cdecl GetRefAPI(int apiVersion, void* imports);
 extern "C" void GLW_GetValidModes();
 extern "C" void GLW_GetValidModes_Override();
@@ -17,9 +19,14 @@ extern "C" void R_Sky_Reset();
 extern "C" void R_Sky_AddSurf();
 extern "C" void R_Sky_Render();
 extern "C" int SurfIsOffscreen();
+extern "C" void R_SepiaScreenShot();
 extern "C" void RendererInitSkyPortalOptions(void);
 
-extern "C" refimport_t ri;
+/* Game EXE allocator; recovered from the Z_Free error-string xref. */
+static const uintptr_t EXE_Z_FREE = 0x0041E000;
+
+typedef void (APIENTRY *QglPixelStoreiFn)(unsigned int pname, int param);
+extern "C" QglPixelStoreiFn qglPixelStorei;
 
 static void logInit();
 static void logClose();
@@ -167,6 +174,77 @@ static void uninstall_console_fix()
         hook_protect(code, (int)sizeof(s_originalConsoleKeyCheck), restore);
         s_consoleKeyCheckPatched = false;
     }
+}
+
+/*
+ * R_SepiaScreenShot allocates exactly width * height * 3 bytes, then calls
+ * glReadPixels(GL_RGB).  With GL_PACK_ALIGNMENT at its default 4, widths not
+ * divisible by four acquire 1-3 padding bytes per row.  At 1366x768 that is
+ * 1,536 bytes beyond the allocation, corrupting the game Z_Free trailer when
+ * a save thumbnail is made.  Read the pixels tightly packed for this one
+ * path; the sepia conversion already expects a contiguous RGB buffer.
+ */
+typedef void (__cdecl *RSepiaScreenShotFn)(void* filename, int width, int height);
+static RSepiaScreenShotFn s_originalRSepiaScreenShot =
+    (RSepiaScreenShotFn)R_SepiaScreenShot;
+static bool s_sepiaScreenshotFixHooked = false;
+static const unsigned int GL_PACK_ALIGNMENT = 0x0D05;
+
+static void __cdecl RSepiaScreenShot_PackAlignmentHook(void* filename,
+                                                        int width, int height)
+{
+    QglPixelStoreiFn pixelStorei = qglPixelStorei;
+    if (pixelStorei)
+        pixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    s_originalRSepiaScreenShot(filename, width, height);
+
+    /* Alice otherwise relies on OpenGL's default packing state. */
+    if (pixelStorei)
+        pixelStorei(GL_PACK_ALIGNMENT, 4);
+}
+
+static void install_sepia_screenshot_fix()
+{
+    LONG status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRSepiaScreenShot,
+                              RSepiaScreenShot_PackAlignmentHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_sepiaScreenshotFixHooked = true;
+        RendererLogPrintf("Save-thumbnail GL_PACK_ALIGNMENT fix installed\n");
+    }
+    else
+        RendererLogPrintf("WARN: failed to install save-thumbnail fix: %ld\n", status);
+}
+
+static void uninstall_sepia_screenshot_fix()
+{
+    if (!s_sepiaScreenshotFixHooked)
+        return;
+
+    LONG status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRSepiaScreenShot,
+                              RSepiaScreenShot_PackAlignmentHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove save-thumbnail fix: %ld\n", status);
+    s_sepiaScreenshotFixHooked = false;
 }
 
 /*
@@ -438,6 +516,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         logInit();
+        install_sepia_screenshot_fix();
         install_console_fix();
         install_sky_portal_trace();
         install_glw_getvalidmodes();
@@ -448,6 +527,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         uninstall_getrefapi();
         uninstall_sky_portal_trace();
         uninstall_console_fix();
+        uninstall_sepia_screenshot_fix();
         logClose();
         break;
     default:
