@@ -21,6 +21,17 @@ extern "C" void R_Sky_Render();
 extern "C" int SurfIsOffscreen();
 extern "C" void R_SepiaScreenShot();
 extern "C" void RendererInitSkyPortalOptions(void);
+extern "C" void RendererInitRemixShaderOptions(void);
+extern "C" void __cdecl RemixComputeColorsHook(void* stage);
+extern "C" void __cdecl RemixComputeTexCoordsHook(void* stage);
+extern "C" void __cdecl RemixTurbulentTexCoordsHook(const void* waveform,
+                                                      float* destination);
+extern "C" void __cdecl RendererInitRemixShaderHooks(
+    void* originalComputeColors, void* originalComputeTexCoords,
+    void* originalTurbulentTexCoords, void* backEndProjection2D);
+extern "C" void __cdecl RendererShutdownRemixShaderHooks(void);
+extern "C" void __cdecl RB_CalcTurbulentTexCoords(const void* waveform,
+                                                    float* destination);
 extern "C" int __cdecl VertexLightingModeHook(void);
 extern "C" void __cdecl RendererInitVertexLightingModeHook(
     void* unfoggedStages, void* shader, void* rVertexLightSlot,
@@ -54,6 +65,7 @@ static void* __cdecl GetRefAPI_ImportTraceHook(int apiVersion, void* imports)
     void* exports = s_originalGetRefAPI(apiVersion, imports);
     /* Created after the import table becomes valid; see sky portal hook. */
     RendererInitSkyPortalOptions();
+    RendererInitRemixShaderOptions();
     return exports;
 }
 
@@ -548,6 +560,240 @@ static bool address_in_renderer_image(const void* address)
     return ptr >= image && ptr < image + nt->OptionalHeader.SizeOfImage;
 }
 
+/*
+ * These are private static tr_shade functions from renderer.lib.  Resolve
+ * them from their code, not linker names, so the hook keeps working in Debug
+ * and Release builds where their final addresses differ.
+ */
+static byte* find_compute_colors()
+{
+    const byte* image = (const byte*)s_rendererModule;
+    const IMAGE_DOS_HEADER* dos;
+    const IMAGE_NT_HEADERS* nt;
+    size_t imageSize;
+    size_t offset;
+    byte* found = nullptr;
+
+    if (!image)
+        return nullptr;
+
+    dos = (const IMAGE_DOS_HEADER*)image;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return nullptr;
+
+    nt = (const IMAGE_NT_HEADERS*)(image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return nullptr;
+
+    imageSize = nt->OptionalHeader.SizeOfImage;
+    for (offset = 0; offset + 29 <= imageSize; ++offset)
+    {
+        byte* code = (byte*)image + offset;
+
+        /* fld1; stack frame; pStage->rgbGen; jump table dispatch */
+        if (code[0] != 0xd9 || code[1] != 0xe8 ||
+            code[2] != 0x83 || code[3] != 0xec || code[4] != 0x10 ||
+            code[5] != 0x55 || code[6] != 0x8b || code[7] != 0x6c ||
+            code[8] != 0x24 || code[9] != 0x18 ||
+            code[10] != 0x8b || code[11] != 0x85 ||
+            code[12] != 0x98 || code[13] != 0x02 ||
+            code[14] != 0x00 || code[15] != 0x00 ||
+            code[16] != 0x48 || code[17] != 0x83 ||
+            code[18] != 0xf8 || code[19] != 0x0f ||
+            code[20] != 0x0f || code[21] != 0x87 ||
+            code[26] != 0xff || code[27] != 0x24 || code[28] != 0x85)
+        {
+            continue;
+        }
+
+        if (found)
+            return nullptr;
+        found = code;
+    }
+
+    return found;
+}
+
+static byte* find_compute_texcoords()
+{
+    const byte* image = (const byte*)s_rendererModule;
+    const IMAGE_DOS_HEADER* dos;
+    const IMAGE_NT_HEADERS* nt;
+    size_t imageSize;
+    size_t offset;
+    byte* found = nullptr;
+
+    if (!image)
+        return nullptr;
+
+    dos = (const IMAGE_DOS_HEADER*)image;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return nullptr;
+
+    nt = (const IMAGE_NT_HEADERS*)(image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return nullptr;
+
+    imageSize = nt->OptionalHeader.SizeOfImage;
+    for (offset = 0; offset + 0x170 <= imageSize; ++offset)
+    {
+        byte* code = (byte*)image + offset;
+
+        /* tr_shade's two-bundle tcGen loop and jump-table dispatch. */
+        if (code[0] != 0x53 || code[1] != 0x55 || code[2] != 0x56 ||
+            code[3] != 0x8b || code[4] != 0x74 || code[5] != 0x24 ||
+            code[6] != 0x10 || code[7] != 0x57 ||
+            code[8] != 0x33 || code[9] != 0xed || code[10] != 0xbf ||
+            code[15] != 0x81 || code[16] != 0xc6 ||
+            code[17] != 0x10 || code[18] != 0x01 ||
+            code[19] != 0x00 || code[20] != 0x00 ||
+            code[21] != 0xeb || code[22] != 0x09 ||
+            code[23] != 0x8d || code[24] != 0xa4 || code[25] != 0x24 ||
+            code[26] != 0x00 || code[27] != 0x00 ||
+            code[28] != 0x00 || code[29] != 0x00 ||
+            code[30] != 0x8b || code[31] != 0xff ||
+            code[32] != 0x83 || code[33] != 0xbe ||
+            code[34] != 0xf8 || code[35] != 0xfe ||
+            code[36] != 0xff || code[37] != 0xff || code[38] != 0x00 ||
+            code[39] != 0x0f || code[40] != 0x84 ||
+            code[45] != 0x8b || code[46] != 0x06 || code[47] != 0x48 ||
+            code[48] != 0x83 || code[49] != 0xf8 || code[50] != 0x05 ||
+            code[51] != 0x0f || code[52] != 0x87 ||
+            code[57] != 0xff || code[58] != 0x24 || code[59] != 0x85)
+        {
+            continue;
+        }
+
+        if (found)
+            return nullptr;
+        found = code;
+    }
+
+    return found;
+}
+
+typedef void (__cdecl *ComputeShaderStageFn)(void* stage);
+typedef void (__cdecl *TurbulentTexCoordsFn)(const void* waveform,
+                                              float* destination);
+
+static ComputeShaderStageFn s_originalComputeColors = nullptr;
+static ComputeShaderStageFn s_originalComputeTexCoords = nullptr;
+static TurbulentTexCoordsFn s_originalTurbulentTexCoords =
+    RB_CalcTurbulentTexCoords;
+static bool s_remixShaderHooksInstalled = false;
+
+static void install_remix_shader_hooks()
+{
+    byte* computeColors = find_compute_colors();
+    byte* computeTexCoords = find_compute_texcoords();
+    uint32_t currentEntityAddress;
+    uint32_t backEndAddress;
+    uint32_t projection2DAddress;
+    LONG status;
+
+    if (!computeColors || !computeTexCoords)
+    {
+        RendererLogPrintf("WARN: Remix shader hook targets not found (colors=%p, texcoords=%p)\n",
+                          computeColors, computeTexCoords);
+        return;
+    }
+
+    /* mov ecx, [_backEnd + 0x518] in ComputeTexCoords at +0x168. */
+    if (computeTexCoords[0x168] != 0x8b ||
+        computeTexCoords[0x169] != 0x0d ||
+        computeTexCoords[0x16e] != 0x81 ||
+        computeTexCoords[0x16f] != 0xc1)
+    {
+        RendererLogPrintf("WARN: ComputeTexCoords backEnd signature mismatch at %p\n",
+                          computeTexCoords);
+        return;
+    }
+
+    memcpy(&currentEntityAddress, &computeTexCoords[0x16a],
+           sizeof(currentEntityAddress));
+    backEndAddress = currentEntityAddress - 0x518;
+    /* Verified in Alice tr_backend.obj: backEnd.projection2D is +0x7ac. */
+    projection2DAddress = backEndAddress + 0x7ac;
+    if (!address_in_renderer_image((void*)(uintptr_t)projection2DAddress))
+    {
+        RendererLogPrintf("WARN: recovered backEnd.projection2D lies outside renderer image\n");
+        return;
+    }
+
+    s_originalComputeColors = (ComputeShaderStageFn)computeColors;
+    s_originalComputeTexCoords = (ComputeShaderStageFn)computeTexCoords;
+    s_originalTurbulentTexCoords = RB_CalcTurbulentTexCoords;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalComputeColors,
+                              RemixComputeColorsHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalComputeTexCoords,
+                              RemixComputeTexCoordsHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalTurbulentTexCoords,
+                              RemixTurbulentTexCoordsHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+    {
+        RendererLogPrintf("WARN: failed to install Remix shader hooks: %ld\n", status);
+        s_originalComputeColors = nullptr;
+        s_originalComputeTexCoords = nullptr;
+        s_originalTurbulentTexCoords = RB_CalcTurbulentTexCoords;
+        return;
+    }
+
+    RendererInitRemixShaderHooks((void*)s_originalComputeColors,
+                                 (void*)s_originalComputeTexCoords,
+                                 (void*)s_originalTurbulentTexCoords,
+                                 (void*)(uintptr_t)projection2DAddress);
+    s_remixShaderHooksInstalled = true;
+    RendererLogPrintf("Remix shader hooks installed: colors %p, texcoords %p, projection2D %p\n",
+                      computeColors, computeTexCoords,
+                      (void*)(uintptr_t)projection2DAddress);
+}
+
+static void uninstall_remix_shader_hooks()
+{
+    LONG status;
+
+    if (s_remixShaderHooksInstalled)
+    {
+        status = DetourTransactionBegin();
+        if (status == NO_ERROR)
+            status = DetourUpdateThread(GetCurrentThread());
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalComputeColors,
+                                  RemixComputeColorsHook);
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalComputeTexCoords,
+                                  RemixComputeTexCoordsHook);
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalTurbulentTexCoords,
+                                  RemixTurbulentTexCoordsHook);
+        if (status == NO_ERROR)
+            status = DetourTransactionCommit();
+        else
+            DetourTransactionAbort();
+
+        if (status != NO_ERROR)
+            RendererLogPrintf("WARN: failed to remove Remix shader hooks: %ld\n", status);
+    }
+
+    RendererShutdownRemixShaderHooks();
+    s_originalComputeColors = nullptr;
+    s_originalComputeTexCoords = nullptr;
+    s_originalTurbulentTexCoords = RB_CalcTurbulentTexCoords;
+    s_remixShaderHooksInstalled = false;
+}
+
 static byte* find_vertex_lighting_finishshader_call()
 {
     const byte* image = (const byte*)s_rendererModule;
@@ -714,9 +960,11 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_sky_portal_trace();
         install_glw_getvalidmodes();
         install_vertex_lighting_mode_hook();
+        install_remix_shader_hooks();
         install_getrefapi();
         break;
     case DLL_PROCESS_DETACH:
+        uninstall_remix_shader_hooks();
         uninstall_vertex_lighting_mode_hook();
         uninstall_glw_getvalidmodes();
         uninstall_getrefapi();

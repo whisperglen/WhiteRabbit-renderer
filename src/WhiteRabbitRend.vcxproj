@@ -26,6 +26,7 @@
     <ClCompile Include="missing.c" />
     <ClCompile Include="str.cpp" />
     <ClCompile Include="trouble.c" />
+    <ClCompile Include="tr_shade.c" />
     <ClCompile Include="tr_shader.c" />
     <ClCompile Include="_dllmain.cpp" />
     <ClCompile Include="win_glimp.c" />

@@ -29,6 +29,9 @@
     <ClCompile Include="trouble.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tr_shade.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tr_shader.c">
       <Filter>Source Files</Filter>
     </ClCompile>
