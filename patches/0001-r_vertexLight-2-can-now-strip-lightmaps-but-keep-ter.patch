@@ -1,0 +1,133 @@
+From cb1977e6533bb7a7a3dddc9e6f40db2522450b29 Mon Sep 17 00:00:00 2001
+From: whisperglen <whisperglen45@gmail.com>
+Date: Fri, 29 May 2026 18:02:09 +0300
+Subject: [PATCH] r_vertexLight 2 can now strip lightmaps but keep terrain
+ blending
+
+---
+ src/renderer/tr_bsp.c    |  2 +-
+ src/renderer/tr_scene.c  |  2 +-
+ src/renderer/tr_shader.c | 67 ++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/src/renderer/tr_bsp.c b/src/renderer/tr_bsp.c
+index 9a17bc4..1f1d4f3 100644
+--- a/src/renderer/tr_bsp.c
++++ b/src/renderer/tr_bsp.c
+@@ -2105,7 +2105,7 @@ void R_LoadEntities( lump_t *l ) {
+ 				break;
+ 			}
+ 			*s++ = 0;
+-			if ( r_vertexLight->integer ) {
++			if ( r_vertexLight->integer == 1 ) { //WG: only do the terrain blend strip for r_vertexLight 1
+ 				R_RemapShader( value, s, "0" );
+ 			}
+ 			continue;
+diff --git a/src/renderer/tr_scene.c b/src/renderer/tr_scene.c
+index c30b484..00731f5 100644
+--- a/src/renderer/tr_scene.c
++++ b/src/renderer/tr_scene.c
+@@ -523,7 +523,7 @@ void RE_RenderScene( const refdef_t *fd ) {
+ 	// turn off dynamic lighting globally by clearing all the
+ 	// dlights if it needs to be disabled or if vertex lighting is enabled
+ 	if ( /*r_dynamiclight->integer == 0 ||*/    // RF, disabled so we can force things like lightning dlights
+-		r_vertexLight->integer == 1 ||
++		r_vertexLight->integer ||
+ 		glConfig.hardwareType == GLHW_PERMEDIA2 ) {
+ 		tr.refdef.num_dlights = 0;
+ 	}
+diff --git a/src/renderer/tr_shader.c b/src/renderer/tr_shader.c
+index b16d22e..b22abb6 100644
+--- a/src/renderer/tr_shader.c
++++ b/src/renderer/tr_shader.c
+@@ -2037,7 +2037,7 @@ pass, trying to guess which is the correct one to best aproximate
+ what it is supposed to look like.
+ =================
+ */
+-static void VertexLightingCollapse( void ) {
++static int VertexLightingCollapse( void ) {
+ 	int stage;
+ 	shaderStage_t   *bestStage;
+ 	int bestImageRank;
+@@ -2115,6 +2115,66 @@ static void VertexLightingCollapse( void ) {
+ 
+ 		memset( pStage, 0, sizeof( *pStage ) );
+ 	}
++
++	return 1;
++}
++
++static int VertexLightingRemoveLightmaps(void) {
++	int stage, nextopenstage;
++	int finalstagenum = 0;
++
++	// Loop through all stages to filter out lightmaps and fix vertex coloring
++	for (stage = 0, nextopenstage = 0; stage < MAX_SHADER_STAGES; stage++) {
++		shaderStage_t* pStage = &stages[stage];
++
++		if (!pStage->active) {
++			break;
++		}
++
++		// 1. If it's a lightmap, skip it entirely (this removes the lightmap)
++		if (pStage->bundle[0].isLightmap || pStage->bundle[0].tcGen == TCGEN_LIGHTMAP) {
++			continue;
++		}
++
++		// 2. If it's NOT a lightmap, copy it to the next available open slot.
++		// This naturally preserves terrain blending stages and Surface Sprites.
++		if (nextopenstage != stage) {
++			stages[nextopenstage] = *pStage;
++		}
++
++		// 3. Force the foundational stage of opaque surfaces to actually be opaque.
++		// Without this, diffuse maps that were originally blending ONTO a lightmap 
++		// will try to blend with the void, causing transparent walls.
++		if (shader.sort == SS_OPAQUE && nextopenstage == 0) {
++			stages[0].stateBits &= ~(GLS_DSTBLEND_BITS | GLS_SRCBLEND_BITS);
++			stages[0].stateBits |= GLS_DEPTHMASK_TRUE;
++			stages[0].alphaGen = AGEN_SKIP;
++		}
++
++		// 4. Fix the color generation (rgbGen).
++		// Since we removed the lightmap, the diffuse textures will be fullbright 
++		// if left at CGEN_IDENTITY. We need them to catch the CPU vertex lighting.
++		if (shader.sort == SS_OPAQUE) {
++			if (stages[nextopenstage].rgbGen == CGEN_IDENTITY || stages[nextopenstage].rgbGen == CGEN_IDENTITY_LIGHTING || stages[nextopenstage].rgbGen == CGEN_LIGHTING_DIFFUSE) {
++				if (shader.lightmapIndex == LIGHTMAP_NONE) {
++					stages[nextopenstage].rgbGen = CGEN_LIGHTING_DIFFUSE;
++				}
++				else {
++					stages[nextopenstage].rgbGen = CGEN_EXACT_VERTEX;
++				}
++			}
++		}
++
++		nextopenstage++;
++		finalstagenum++;
++	}
++
++	// 5. Clean up any leftover garbage stages at the end of the array
++	for (stage = finalstagenum; stage < MAX_SHADER_STAGES; stage++) {
++		memset(&stages[stage], 0, sizeof(stages[stage]));
++	}
++
++	return finalstagenum;
+ }
+ 
+ /*
+@@ -2259,8 +2319,9 @@ static shader_t *FinishShader( void ) {
+ 	// if we are in r_vertexLight mode, never use a lightmap texture
+ 	//
+ 	if ( stage > 1 && ( ( r_vertexLight->integer && !r_uiFullScreen->integer ) || glConfig.hardwareType == GLHW_PERMEDIA2 ) ) {
+-		VertexLightingCollapse();
+-		stage = 1;
++		stage = r_vertexLight->integer == 1 ?
++			VertexLightingCollapse() :
++			VertexLightingRemoveLightmaps();
+ 		hasLightmapStage = qfalse;
+ 	}
+ 
+-- 
+2.34.0.windows.1
+

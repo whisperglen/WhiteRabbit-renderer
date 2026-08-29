@@ -21,6 +21,11 @@ extern "C" void R_Sky_Render();
 extern "C" int SurfIsOffscreen();
 extern "C" void R_SepiaScreenShot();
 extern "C" void RendererInitSkyPortalOptions(void);
+extern "C" int __cdecl VertexLightingModeHook(void);
+extern "C" void __cdecl RendererInitVertexLightingModeHook(
+    void* unfoggedStages, void* shader, void* rVertexLightSlot,
+    void* originalVertexLightingCollapse);
+extern "C" void __cdecl RendererShutdownVertexLightingModeHook(void);
 
 /* Game EXE allocator; recovered from the Z_Free error-string xref. */
 static const uintptr_t EXE_Z_FREE = 0x0041E000;
@@ -33,6 +38,8 @@ static void logClose();
 extern "C" void RendererLogPrintf(const char* fmt, ...);
 int hook_unprotect(void* ptr, int size, unsigned long* restore);
 int hook_protect(void* ptr, int size, unsigned long restore);
+
+static HMODULE s_rendererModule = nullptr;
 
 /*
  * Keep the renderer's original GetRefAPI as the call target, but interpose the
@@ -509,26 +516,215 @@ static void uninstall_glw_getvalidmodes()
     s_glwGetValidModesHooked = false;
 }
 
+/*
+ * FinishShader knows that renderer.lib's original VertexLightingCollapse
+ * always leaves exactly one stage.  MSVC consequently emits `mov edi, 1`
+ * after its call and jumps over CollapseMultitexture.  r_vertexLight 2 keeps
+ * several non-lightmap stages, so replace that one call-site sequence rather
+ * than detouring the collapse function globally.
+ */
+static byte* s_vertexLightingCallSite = nullptr;
+static byte s_originalVertexLightingCallSite[14];
+static bool s_vertexLightingModeHooked = false;
+
+static bool address_in_renderer_image(const void* address)
+{
+    const byte* image = (const byte*)s_rendererModule;
+    const IMAGE_DOS_HEADER* dos;
+    const IMAGE_NT_HEADERS* nt;
+    const byte* ptr = (const byte*)address;
+
+    if (!image || !address)
+        return false;
+
+    dos = (const IMAGE_DOS_HEADER*)image;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+
+    nt = (const IMAGE_NT_HEADERS*)(image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+
+    return ptr >= image && ptr < image + nt->OptionalHeader.SizeOfImage;
+}
+
+static byte* find_vertex_lighting_finishshader_call()
+{
+    const byte* image = (const byte*)s_rendererModule;
+    const IMAGE_DOS_HEADER* dos;
+    const IMAGE_NT_HEADERS* nt;
+    size_t imageSize;
+    size_t offset;
+
+    if (!image)
+        return nullptr;
+
+    dos = (const IMAGE_DOS_HEADER*)image;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return nullptr;
+
+    nt = (const IMAGE_NT_HEADERS*)(image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return nullptr;
+
+    imageSize = nt->OptionalHeader.SizeOfImage;
+    for (offset = 0x15; offset + 40 <= imageSize; ++offset)
+    {
+        byte* code = (byte*)image + offset;
+
+        /* call; mov edi,1; xor ebp,ebp; jmp; then CollapseMultitexture */
+        if (code[0] != 0xe8 ||
+            code[5] != 0xbf || code[6] != 1 || code[7] != 0 ||
+            code[8] != 0 || code[9] != 0 ||
+            code[10] != 0x33 || code[11] != 0xed ||
+            code[12] != 0xeb || code[13] != 0x1a ||
+            code[14] != 0x83 || code[15] != 0x3d || code[20] != 0 ||
+            code[21] != 0x74 || code[22] != 0x11 ||
+            code[23] != 0x8d || code[24] != 0x44 ||
+            code[25] != 0x24 || code[26] != 0x10 || code[27] != 0x50 ||
+            code[28] != 0xe8 ||
+            code[33] != 0x8b || code[34] != 0x7c ||
+            code[35] != 0x24 || code[36] != 0x14 ||
+            code[37] != 0x83 || code[38] != 0xc4 || code[39] != 0x04 ||
+            code[-21] != 0x8b || code[-20] != 0x15 ||
+            code[-15] != 0x83 || code[-14] != 0x7a ||
+            code[-13] != 0x20 || code[-12] != 0 ||
+            code[-11] != 0x75 || code[-10] != 0x09)
+        {
+            continue;
+        }
+
+        return code;
+    }
+
+    return nullptr;
+}
+
+static void install_vertex_lighting_mode_hook()
+{
+    byte* callSite = find_vertex_lighting_finishshader_call();
+    int32_t originalCallOffset;
+    int32_t hookCallOffset;
+    byte* originalCollapse;
+    uint32_t shaderAddress;
+    uint32_t stagesAddress;
+    uint32_t vertexLightSlotAddress;
+    unsigned long restore;
+    static const byte continuationPatch[9] = {
+        0x89, 0x44, 0x24, 0x10, /* mov [esp+10h], eax */
+        0x89, 0xc7,             /* mov edi, eax */
+        0x33, 0xed,             /* xor ebp, ebp */
+        0x90                    /* fall through to CollapseMultitexture */
+    };
+
+    if (!callSite)
+    {
+        RendererLogPrintf("WARN: FinishShader vertex-light call site not found\n");
+        return;
+    }
+
+    memcpy(&originalCallOffset, &callSite[1], sizeof(originalCallOffset));
+    originalCollapse = callSite + 5 + originalCallOffset;
+    if (!address_in_renderer_image(originalCollapse) ||
+        originalCollapse[0] != 0xd9 || originalCollapse[1] != 0x05 ||
+        originalCollapse[6] != 0x56 ||
+        originalCollapse[7] != 0xd8 || originalCollapse[8] != 0x1d ||
+        originalCollapse[13] != 0x57 || originalCollapse[14] != 0xdf ||
+        originalCollapse[15] != 0xe0 || originalCollapse[16] != 0xf6 ||
+        originalCollapse[17] != 0xc4 || originalCollapse[18] != 0x44 ||
+        originalCollapse[0x1b] != 0xbb)
+    {
+        RendererLogPrintf("WARN: FinishShader collapse target signature mismatch at %p\n",
+                          originalCollapse);
+        return;
+    }
+
+    /* fcomp [_shader+4c], mov ebx, offset _unfoggedStages. */
+    memcpy(&shaderAddress, &originalCollapse[9], sizeof(shaderAddress));
+    shaderAddress -= 0x4c;
+    memcpy(&stagesAddress, &originalCollapse[0x1c], sizeof(stagesAddress));
+    memcpy(&vertexLightSlotAddress, &callSite[-19], sizeof(vertexLightSlotAddress));
+
+    if (!address_in_renderer_image((void*)(uintptr_t)shaderAddress) ||
+        !address_in_renderer_image((void*)(uintptr_t)stagesAddress) ||
+        !address_in_renderer_image((void*)(uintptr_t)vertexLightSlotAddress))
+    {
+        RendererLogPrintf("WARN: FinishShader recovered state lies outside renderer image\n");
+        return;
+    }
+
+    hookCallOffset = (int32_t)((intptr_t)VertexLightingModeHook -
+                               (intptr_t)(callSite + 5));
+    if (!hook_unprotect(callSite, (int)sizeof(s_originalVertexLightingCallSite),
+                        &restore))
+    {
+        return;
+    }
+
+    memcpy(s_originalVertexLightingCallSite, callSite,
+           sizeof(s_originalVertexLightingCallSite));
+    memcpy(&callSite[1], &hookCallOffset, sizeof(hookCallOffset));
+    memcpy(&callSite[5], continuationPatch, sizeof(continuationPatch));
+    FlushInstructionCache(GetCurrentProcess(), callSite,
+                          sizeof(s_originalVertexLightingCallSite));
+    hook_protect(callSite, (int)sizeof(s_originalVertexLightingCallSite), restore);
+
+    RendererInitVertexLightingModeHook((void*)(uintptr_t)stagesAddress,
+                                       (void*)(uintptr_t)shaderAddress,
+                                       (void*)(uintptr_t)vertexLightSlotAddress,
+                                       originalCollapse);
+    s_vertexLightingCallSite = callSite;
+    s_vertexLightingModeHooked = true;
+    RendererLogPrintf("r_vertexLight 2 hook installed at %p; collapse %p, stages %p, shader %p\n",
+                      callSite, originalCollapse, (void*)(uintptr_t)stagesAddress,
+                      (void*)(uintptr_t)shaderAddress);
+}
+
+static void uninstall_vertex_lighting_mode_hook()
+{
+    unsigned long restore;
+
+    if (s_vertexLightingModeHooked && s_vertexLightingCallSite &&
+        hook_unprotect(s_vertexLightingCallSite,
+                       (int)sizeof(s_originalVertexLightingCallSite), &restore))
+    {
+        memcpy(s_vertexLightingCallSite, s_originalVertexLightingCallSite,
+               sizeof(s_originalVertexLightingCallSite));
+        FlushInstructionCache(GetCurrentProcess(), s_vertexLightingCallSite,
+                              sizeof(s_originalVertexLightingCallSite));
+        hook_protect(s_vertexLightingCallSite,
+                     (int)sizeof(s_originalVertexLightingCallSite), restore);
+    }
+
+    RendererShutdownVertexLightingModeHook();
+    s_vertexLightingCallSite = nullptr;
+    s_vertexLightingModeHooked = false;
+}
+
 BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
 {
     switch ( ul_reason_for_call )
     {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
+        s_rendererModule = hModule;
         logInit();
         install_sepia_screenshot_fix();
         install_console_fix();
         install_sky_portal_trace();
         install_glw_getvalidmodes();
+        install_vertex_lighting_mode_hook();
         install_getrefapi();
         break;
     case DLL_PROCESS_DETACH:
+        uninstall_vertex_lighting_mode_hook();
         uninstall_glw_getvalidmodes();
         uninstall_getrefapi();
         uninstall_sky_portal_trace();
         uninstall_console_fix();
         uninstall_sepia_screenshot_fix();
         logClose();
+        s_rendererModule = nullptr;
         break;
     default:
         break;
