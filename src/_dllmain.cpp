@@ -15,6 +15,7 @@ extern "C" void* __cdecl GetRefAPI(int apiVersion, void* imports);
 extern "C" void GLW_GetValidModes();
 extern "C" void GLW_GetValidModes_Override();
 extern "C" void RB_StageIteratorSky();
+extern "C" void R_AddWorldSurfaces();
 extern "C" void R_Sky_Reset();
 extern "C" void R_Sky_AddSurf();
 extern "C" void R_Sky_Render();
@@ -80,6 +81,7 @@ static const uintptr_t EXE_KEY_SET_BINDING = 0x00407870;
 static const uintptr_t EXE_CONSOLE_KEY_CHECK = 0x0040823A;
 static const int DEFAULT_CONSOLE_KEY_GRAVE = 96;
 static const int DEFAULT_CONSOLE_KEY_TILDE = 126;
+static const uintptr_t EXE_RUNNING_FROM_ALICE2_CHECK = 0x4655F4;
 
 typedef int (__cdecl *KeySetBindingFn)(int keyId, char* command);
 typedef int (__cdecl *KeyStringToKeynumFn)(const char* keyName);
@@ -89,6 +91,8 @@ static KeySetBindingFn s_originalKeySetBinding =
 static bool s_consoleBindHooked = false;
 static bool s_consoleKeyCheckPatched = false;
 static byte s_originalConsoleKeyCheck[12];
+static bool s_runningFromAlice2Patched = false;
+static byte s_originalrunningFromAlice2[30];
 
 static bool patch_console_key_check(int keyId)
 {
@@ -195,6 +199,42 @@ static void uninstall_console_fix()
     }
 }
 
+static bool patch_running_from_alice2()
+{
+    // Disable the '-RunningFromAlice2' launch argument check
+    byte* code = (byte*)EXE_RUNNING_FROM_ALICE2_CHECK;
+    unsigned long restore;
+
+    if (!s_runningFromAlice2Patched)
+        memcpy(s_originalrunningFromAlice2, code, sizeof(s_originalrunningFromAlice2));
+
+    if (!hook_unprotect(code, (int)sizeof(s_originalrunningFromAlice2), &restore))
+        return false;
+    
+    memset(code, 0x90, sizeof(s_originalrunningFromAlice2));
+    FlushInstructionCache(GetCurrentProcess(), code, sizeof(s_originalrunningFromAlice2));
+    hook_protect(code, (int)sizeof(s_originalrunningFromAlice2), restore);
+
+    s_runningFromAlice2Patched = true;
+    RendererLogPrintf("RunningFromAlice2 was patched\n");
+    return true;
+}
+
+static void uninstall_runningfromalice2()
+{
+    byte* code = (byte*)EXE_RUNNING_FROM_ALICE2_CHECK;
+    unsigned long restore;
+
+    if (s_runningFromAlice2Patched &&
+        hook_unprotect(code, (int)sizeof(s_originalrunningFromAlice2), &restore))
+    {
+        memcpy(code, s_originalrunningFromAlice2, sizeof(s_originalrunningFromAlice2));
+        FlushInstructionCache(GetCurrentProcess(), code, sizeof(s_originalrunningFromAlice2));
+        hook_protect(code, (int)sizeof(s_originalrunningFromAlice2), restore);
+        s_runningFromAlice2Patched = false;
+    }
+}
+
 /*
  * R_SepiaScreenShot allocates exactly width * height * 3 bytes, then calls
  * glReadPixels(GL_RGB).  With GL_PACK_ALIGNMENT at its default 4, widths not
@@ -276,6 +316,7 @@ static void uninstall_sepia_screenshot_fix()
 typedef void (__cdecl *RSkyResetFn)();
 typedef void (__cdecl *RSkyAddSurfFn)(void* surface);
 typedef void (__cdecl *RSkyRenderFn)();
+typedef void (__cdecl *RMarkLeavesFn)();
 typedef int (__cdecl *SurfIsOffscreenFn)(const void* surface, void* shader,
                                          int entityNum);
 /* cvar_t::integer is at 0x20 in Alice's 32-bit game ABI. */
@@ -287,18 +328,19 @@ typedef struct renderer_cvar_s {
 static RSkyResetFn s_originalRSkyReset = R_Sky_Reset;
 static RSkyAddSurfFn s_originalRSkyAddSurf = (RSkyAddSurfFn)R_Sky_AddSurf;
 static RSkyRenderFn s_originalRSkyRender = R_Sky_Render;
+static RMarkLeavesFn s_originalRMarkLeaves = nullptr;
 static SurfIsOffscreenFn s_originalSurfIsOffscreen =
     (SurfIsOffscreenFn)SurfIsOffscreen;
 static const uintptr_t s_rSkyRenderAddress = (uintptr_t)R_Sky_Render;
 static bool s_skyPortalTraceHooked = false;
-static unsigned int s_skyPortalSurfaceCount = 0;
-static int s_lastSkyPortalSurfaceCount = -1;
-static int s_lastSkyPortalReportTime = -0x3fffffff;
-static unsigned int s_skyRenderDepth = 0;
-static bool s_skyPortalViewInvoked = false;
-static bool s_insideSkyPortalRender = false;
+static bool s_skyPortalNovisHooked = false;
 static renderer_cvar_t* s_forceSkyPortal = nullptr;
 static unsigned int s_forcedSkyPortalTraceCount = 0;
+static renderer_cvar_t** s_rNovisSlot = nullptr;
+static bool s_skyPortalMarkLeavesArmed = false;
+static unsigned int s_skyPortalNovisTraceCount = 0;
+
+static bool address_in_renderer_image(const void* address);
 
 extern "C" void RendererInitSkyPortalOptions(void)
 {
@@ -333,6 +375,173 @@ static int __cdecl SurfIsOffscreen_SkyPortalHook(const void* surface,
     }
 
     return originalResult;
+}
+
+/*
+ * R_AddWorldSurfaces calls its private R_MarkLeaves at +0x30.  The latter
+ * loads the renderer's r_novis cvar slot at +0x6f.  Both instruction shapes
+ * are checked before using the relocated addresses, so this remains tied to
+ * the linked renderer build rather than a fixed DLL base address.
+ */
+static bool recover_sky_portal_novis_targets()
+{
+    byte* addWorldSurfaces = (byte*)R_AddWorldSurfaces;
+    byte* markLeaves;
+    int32_t callDisplacement;
+    uint32_t rNovisSlotAddress;
+
+    if (s_originalRMarkLeaves && s_rNovisSlot)
+        return true;
+
+    if (!addWorldSurfaces ||
+        addWorldSurfaces[0] != 0xa1 ||
+        addWorldSurfaces[5] != 0x83 || addWorldSurfaces[6] != 0x78 ||
+        addWorldSurfaces[7] != 0x20 || addWorldSurfaces[8] != 0x00 ||
+        addWorldSurfaces[9] != 0x0f || addWorldSurfaces[10] != 0x84 ||
+        addWorldSurfaces[0x30] != 0xe8)
+    {
+        RendererLogPrintf("WARN: R_AddWorldSurfaces signature mismatch; sky r_novis scope disabled\n");
+        return false;
+    }
+
+    memcpy(&callDisplacement, addWorldSurfaces + 0x31, sizeof(callDisplacement));
+    markLeaves = addWorldSurfaces + 0x35 + callDisplacement;
+    if (!address_in_renderer_image(markLeaves) ||
+        markLeaves[0] != 0x51 || markLeaves[1] != 0xa1 ||
+        markLeaves[6] != 0x55 || markLeaves[7] != 0x33 ||
+        markLeaves[8] != 0xed || markLeaves[9] != 0x57 ||
+        markLeaves[10] != 0x39 || markLeaves[11] != 0x68 ||
+        markLeaves[12] != 0x20 || markLeaves[0x6f] != 0xa1)
+    {
+        RendererLogPrintf("WARN: R_MarkLeaves signature mismatch at %p; sky r_novis scope disabled\n",
+                          markLeaves);
+        return false;
+    }
+
+    memcpy(&rNovisSlotAddress, markLeaves + 0x70, sizeof(rNovisSlotAddress));
+    if (!address_in_renderer_image((const void*)(uintptr_t)rNovisSlotAddress))
+    {
+        RendererLogPrintf("WARN: recovered r_novis slot lies outside renderer image\n");
+        return false;
+    }
+
+    s_originalRMarkLeaves = (RMarkLeavesFn)markLeaves;
+    s_rNovisSlot = (renderer_cvar_t**)(uintptr_t)rNovisSlotAddress;
+    RendererLogPrintf("Sky r_novis scope targets: R_MarkLeaves=%p, r_novis slot=%p\n",
+                      markLeaves, s_rNovisSlot);
+    return true;
+}
+
+static void __cdecl RMarkLeaves_SkyPortalNovisHook()
+{
+    renderer_cvar_t* rNovis;
+    int savedNoVis;
+
+    if (!s_skyPortalMarkLeavesArmed || !s_rNovisSlot)
+    {
+        s_originalRMarkLeaves();
+        return;
+    }
+
+    /* Consume the arm before calling original: only the sky view's first
+       PVS build is changed, never a recursively spawned portal/mirror view. */
+    s_skyPortalMarkLeavesArmed = false;
+    rNovis = *s_rNovisSlot;
+    if (!rNovis || rNovis->integer == 0)
+    {
+        s_originalRMarkLeaves();
+        return;
+    }
+
+    savedNoVis = rNovis->integer;
+    rNovis->integer = 0;
+    if (s_skyPortalNovisTraceCount++ < 16)
+        RendererLogPrintf("Sky portal PVS: temporarily r_novis %d -> 0\n", savedNoVis);
+
+    s_originalRMarkLeaves();
+    rNovis->integer = savedNoVis;
+}
+
+static void __cdecl RSkyRender_NovisHook()
+{
+    renderer_cvar_t* rNovis = s_rNovisSlot ? *s_rNovisSlot : nullptr;
+    const bool previousArm = s_skyPortalMarkLeavesArmed;
+
+    /* R_Sky_Render may early-out.  In that case the saved arm is simply
+       restored and no main-view visibility state has been changed. */
+    if (rNovis && rNovis->integer != 0)
+        s_skyPortalMarkLeavesArmed = true;
+
+    s_originalRSkyRender();
+    s_skyPortalMarkLeavesArmed = previousArm;
+}
+
+static void install_sky_portal_novis_fix()
+{
+    LONG status;
+
+    if (s_skyPortalNovisHooked || !recover_sky_portal_novis_targets())
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRSkyRender,
+                              RSkyRender_NovisHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRMarkLeaves,
+                              RMarkLeaves_SkyPortalNovisHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_skyPortalNovisHooked = true;
+        RendererLogPrintf("Sky portal r_novis PVS scope installed\n");
+    }
+    else
+    {
+        RendererLogPrintf("WARN: failed to install sky portal r_novis scope: %ld\n",
+                          status);
+        s_originalRSkyRender = R_Sky_Render;
+        s_originalRMarkLeaves = nullptr;
+        s_rNovisSlot = nullptr;
+    }
+}
+
+static void uninstall_sky_portal_novis_fix()
+{
+    LONG status;
+
+    if (!s_skyPortalNovisHooked)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRSkyRender,
+                              RSkyRender_NovisHook);
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRMarkLeaves,
+                              RMarkLeaves_SkyPortalNovisHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove sky portal r_novis scope: %ld\n",
+                          status);
+
+    s_originalRSkyRender = R_Sky_Render;
+    s_originalRMarkLeaves = nullptr;
+    s_rNovisSlot = nullptr;
+    s_skyPortalMarkLeavesArmed = false;
+    s_skyPortalNovisHooked = false;
 }
 
 static void install_sky_portal_trace()
@@ -957,7 +1166,9 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         logInit();
         install_sepia_screenshot_fix();
         install_console_fix();
+        patch_running_from_alice2();
         install_sky_portal_trace();
+        install_sky_portal_novis_fix();
         install_glw_getvalidmodes();
         install_vertex_lighting_mode_hook();
         install_remix_shader_hooks();
@@ -968,7 +1179,9 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         uninstall_vertex_lighting_mode_hook();
         uninstall_glw_getvalidmodes();
         uninstall_getrefapi();
+        uninstall_sky_portal_novis_fix();
         uninstall_sky_portal_trace();
+        uninstall_runningfromalice2();
         uninstall_console_fix();
         uninstall_sepia_screenshot_fix();
         logClose();
