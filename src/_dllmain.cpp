@@ -19,6 +19,7 @@ extern "C" void R_AddWorldSurfaces();
 extern "C" void R_Sky_Reset();
 extern "C" void R_Sky_AddSurf();
 extern "C" void R_Sky_Render();
+extern "C" void R_SortDrawSurfs();
 extern "C" int SurfIsOffscreen();
 extern "C" void R_SepiaScreenShot();
 extern "C" void RendererInitSkyPortalOptions(void);
@@ -38,6 +39,11 @@ extern "C" void __cdecl RendererInitVertexLightingModeHook(
     void* unfoggedStages, void* shader, void* rVertexLightSlot,
     void* originalVertexLightingCollapse);
 extern "C" void __cdecl RendererShutdownVertexLightingModeHook(void);
+extern "C" void __cdecl StableDrawSurfQsortFastHook(void* base,
+                                                       uint32_t count,
+                                                       uint32_t elementSize);
+extern "C" void __cdecl RendererInitStableDrawSurfSort(void* originalQsortFast);
+extern "C" void __cdecl RendererShutdownStableDrawSurfSort(void);
 
 /* Game EXE allocator; recovered from the Z_Free error-string xref. */
 static const uintptr_t EXE_Z_FREE = 0x0041E000;
@@ -770,6 +776,135 @@ static bool address_in_renderer_image(const void* address)
 }
 
 /*
+ * qsortFast is private to tr_main.  R_SortDrawSurfs invokes it for the front
+ * and back draw-surface arrays with 8-byte drawSurf_t entries.  Resolve its
+ * address through those calls: this survives the different final DLL layout
+ * of Debug and Release builds without importing a private library symbol.
+ */
+typedef void (__cdecl *QsortFastFn)(void* base, uint32_t count,
+                                    uint32_t elementSize);
+static QsortFastFn s_originalQsortFast = nullptr;
+static bool s_stableDrawSurfSortHooked = false;
+
+static byte* recover_qsort_fast()
+{
+    byte* sortDrawSurfs = resolve_local_jump((byte*)R_SortDrawSurfs,
+                                              "R_SortDrawSurfs");
+    int32_t firstDisplacement;
+    int32_t secondDisplacement;
+    byte* firstTarget;
+    byte* secondTarget;
+
+    if (!sortDrawSurfs || !address_in_renderer_image(sortDrawSurfs))
+        return nullptr;
+
+    /* Alice tr_main.obj: push ebx/ebp/esi/edi; call qsortFast at +0x25/+0x36. */
+    if (sortDrawSurfs[0] != 0x53 || sortDrawSurfs[1] != 0x55 ||
+        sortDrawSurfs[2] != 0x56 || sortDrawSurfs[3] != 0x57 ||
+        sortDrawSurfs[4] != 0x8b || sortDrawSurfs[5] != 0x7c ||
+        sortDrawSurfs[6] != 0x24 || sortDrawSurfs[7] != 0x18 ||
+        sortDrawSurfs[8] != 0xb8 || sortDrawSurfs[9] != 0x00 ||
+        sortDrawSurfs[10] != 0x00 || sortDrawSurfs[11] != 0x01 ||
+        sortDrawSurfs[12] != 0x00 || sortDrawSurfs[0x25] != 0xe8 ||
+        sortDrawSurfs[0x36] != 0xe8)
+    {
+        RendererLogPrintf("WARN: R_SortDrawSurfs signature/call layout did not match\n");
+        return nullptr;
+    }
+
+    memcpy(&firstDisplacement, sortDrawSurfs + 0x26, sizeof(firstDisplacement));
+    memcpy(&secondDisplacement, sortDrawSurfs + 0x37, sizeof(secondDisplacement));
+    firstTarget = sortDrawSurfs + 0x2a + firstDisplacement;
+    secondTarget = sortDrawSurfs + 0x3b + secondDisplacement;
+
+    if (firstTarget != secondTarget || !address_in_renderer_image(firstTarget))
+    {
+        RendererLogPrintf("WARN: R_SortDrawSurfs qsortFast targets do not match (%p, %p)\n",
+                          firstTarget, secondTarget);
+        return nullptr;
+    }
+
+    /* qsortFast: sub esp,0xf4; push edi; mov edi,[esp+0x100]; cmp edi,2. */
+    if (firstTarget[0] != 0x81 || firstTarget[1] != 0xec ||
+        firstTarget[2] != 0xf4 || firstTarget[3] != 0x00 ||
+        firstTarget[4] != 0x00 || firstTarget[5] != 0x00 ||
+        firstTarget[6] != 0x57 || firstTarget[7] != 0x8b ||
+        firstTarget[8] != 0xbc || firstTarget[9] != 0x24 ||
+        firstTarget[10] != 0x00 || firstTarget[11] != 0x01 ||
+        firstTarget[12] != 0x00 || firstTarget[13] != 0x00 ||
+        firstTarget[14] != 0x83 || firstTarget[15] != 0xff ||
+        firstTarget[16] != 0x02)
+    {
+        RendererLogPrintf("WARN: recovered qsortFast signature did not match at %p\n",
+                          firstTarget);
+        return nullptr;
+    }
+
+    return firstTarget;
+}
+
+static void install_stable_draw_surf_sort()
+{
+    byte* qsortFast = recover_qsort_fast();
+    LONG status;
+
+    if (!qsortFast)
+        return;
+
+    s_originalQsortFast = (QsortFastFn)qsortFast;
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalQsortFast,
+                              StableDrawSurfQsortFastHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+    {
+        RendererLogPrintf("WARN: failed to install stable drawSurf sort hook: %ld\n",
+                          status);
+        s_originalQsortFast = nullptr;
+        return;
+    }
+
+    RendererInitStableDrawSurfSort((void*)s_originalQsortFast);
+    s_stableDrawSurfSortHooked = true;
+    RendererLogPrintf("Stable drawSurf sort installed: R_SortDrawSurfs=%p qsortFast=%p\n",
+                      (void*)R_SortDrawSurfs, qsortFast);
+}
+
+static void uninstall_stable_draw_surf_sort()
+{
+    LONG status;
+
+    if (s_stableDrawSurfSortHooked)
+    {
+        status = DetourTransactionBegin();
+        if (status == NO_ERROR)
+            status = DetourUpdateThread(GetCurrentThread());
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalQsortFast,
+                                  StableDrawSurfQsortFastHook);
+        if (status == NO_ERROR)
+            status = DetourTransactionCommit();
+        else
+            DetourTransactionAbort();
+
+        if (status != NO_ERROR)
+            RendererLogPrintf("WARN: failed to remove stable drawSurf sort hook: %ld\n",
+                              status);
+    }
+
+    RendererShutdownStableDrawSurfSort();
+    s_originalQsortFast = nullptr;
+    s_stableDrawSurfSortHooked = false;
+}
+
+/*
  * These are private static tr_shade functions from renderer.lib.  Resolve
  * them from their code, not linker names, so the hook keeps working in Debug
  * and Release builds where their final addresses differ.
@@ -1170,6 +1305,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_sky_portal_trace();
         install_sky_portal_novis_fix();
         install_glw_getvalidmodes();
+        install_stable_draw_surf_sort();
         install_vertex_lighting_mode_hook();
         install_remix_shader_hooks();
         install_getrefapi();
@@ -1177,6 +1313,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
     case DLL_PROCESS_DETACH:
         uninstall_remix_shader_hooks();
         uninstall_vertex_lighting_mode_hook();
+        uninstall_stable_draw_surf_sort();
         uninstall_glw_getvalidmodes();
         uninstall_getrefapi();
         uninstall_sky_portal_novis_fix();

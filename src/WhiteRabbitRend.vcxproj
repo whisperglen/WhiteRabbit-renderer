@@ -28,6 +28,7 @@
     <ClCompile Include="trouble.c" />
     <ClCompile Include="tr_shade.c" />
     <ClCompile Include="tr_shader.c" />
+    <ClCompile Include="tr_sort.c" />
     <ClCompile Include="_dllmain.cpp" />
     <ClCompile Include="win_glimp.c" />
   </ItemGroup>
