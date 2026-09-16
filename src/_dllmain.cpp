@@ -8,6 +8,8 @@
 #include <intrin.h>
 #include <detours.h>
 #include "alice_renderer_api.h"
+#define RMX_ADD_IMPL
+#include "qindie_rmx.h"
 
 extern "C" refimport_t ri;
 
@@ -58,6 +60,7 @@ int hook_unprotect(void* ptr, int size, unsigned long* restore);
 int hook_protect(void* ptr, int size, unsigned long restore);
 
 static HMODULE s_rendererModule = nullptr;
+static HMODULE s_opengl32 = nullptr;
 
 /*
  * Keep the renderer's original GetRefAPI as the call target, but interpose the
@@ -1033,6 +1036,7 @@ static void install_remix_shader_hooks()
     uint32_t currentEntityAddress;
     uint32_t backEndAddress;
     uint32_t projection2DAddress;
+    uint32_t cameraMatrix;
     LONG status;
 
     if (!computeColors || !computeTexCoords)
@@ -1063,6 +1067,8 @@ static void install_remix_shader_hooks()
         RendererLogPrintf("WARN: recovered backEnd.projection2D lies outside renderer image\n");
         return;
     }
+    cameraMatrix = backEndAddress + 0x2a0;
+    qind_mat_preferred_address((const void*)cameraMatrix);
 
     s_originalComputeColors = (ComputeShaderStageFn)computeColors;
     s_originalComputeTexCoords = (ComputeShaderStageFn)computeTexCoords;
@@ -1298,7 +1304,9 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         s_rendererModule = hModule;
+        s_opengl32 = LoadLibrary("opengl32");
         logInit();
+        rmx_interface_init(s_opengl32);
         install_sepia_screenshot_fix();
         install_console_fix();
         patch_running_from_alice2();
@@ -1322,6 +1330,8 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         uninstall_console_fix();
         uninstall_sepia_screenshot_fix();
         logClose();
+        if(s_opengl32) FreeLibrary(s_opengl32);
+        s_opengl32 = nullptr;
         s_rendererModule = nullptr;
         break;
     default:
