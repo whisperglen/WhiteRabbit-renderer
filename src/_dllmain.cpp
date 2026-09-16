@@ -11,6 +11,8 @@
 #define RMX_ADD_IMPL
 #include "qindie_rmx.h"
 
+#define EXEC_APPEND 2
+
 extern "C" refimport_t ri;
 
 extern "C" void* __cdecl GetRefAPI(int apiVersion, void* imports);
@@ -24,6 +26,14 @@ extern "C" void R_Sky_Render();
 extern "C" void R_SortDrawSurfs();
 extern "C" int SurfIsOffscreen();
 extern "C" void R_SepiaScreenShot();
+extern "C" void RE_LoadWorldMap(const char* mapName);
+extern "C" void R_Register();
+extern "C" void RE_Shutdown(int destroyWindow);
+extern "C" void RE_AddLightToScene(const vec3_t org, float intensity,
+                                    float r, float g, float b, int type);
+extern "C" void RE_AddRefEntityToScene(const refEntity_t* ent);
+extern "C" void RE_BeginFrame(int stereoFrame);
+extern "C" void RE_RenderScene(const refdef_t* fd);
 extern "C" void RendererInitSkyPortalOptions(void);
 extern "C" void RendererInitRemixShaderOptions(void);
 extern "C" void __cdecl RemixComputeColorsHook(void* stage);
@@ -58,6 +68,27 @@ static void logClose();
 extern "C" void RendererLogPrintf(const char* fmt, ...);
 int hook_unprotect(void* ptr, int size, unsigned long* restore);
 int hook_protect(void* ptr, int size, unsigned long restore);
+static void QDECL a1_flashlight_toggle(void);
+
+/* Alice cvar_t layout, recovered from R_Register and the renderer ABI. */
+typedef struct cvar_s {
+    const char* name;
+    const char* string;
+    const char* resetString;
+    const char* latchedString;
+    int flags;
+    qboolean modified;
+    int modificationCount;
+    float value;
+    int integer;
+    struct cvar_s* next;
+} cvar_t;
+
+static const int CVAR_ARCHIVE = 1;
+static cvar_t* r_rmx_coronas = nullptr;
+static cvar_t* r_rmx_dynamiclight = nullptr;
+static uint32_t r_rmxdlights = 0;
+static uint32_t r_rmxcoronas = 0;
 
 static HMODULE s_rendererModule = nullptr;
 static HMODULE s_opengl32 = nullptr;
@@ -73,10 +104,415 @@ static GetRefAPIFn s_originalGetRefAPI = GetRefAPI;
 static void* __cdecl GetRefAPI_ImportTraceHook(int apiVersion, void* imports)
 {
     void* exports = s_originalGetRefAPI(apiVersion, imports);
+
     /* Created after the import table becomes valid; see sky portal hook. */
     RendererInitSkyPortalOptions();
     RendererInitRemixShaderOptions();
     return exports;
+}
+
+/*
+ * Notify the Remix wrapper before the renderer starts replacing its world
+ * state, then continue through Detours' trampoline into the original
+ * implementation.
+ */
+typedef void (__cdecl *RELoadWorldMapFn)(const char* mapName);
+static RELoadWorldMapFn s_originalRELoadWorldMap = RE_LoadWorldMap;
+static bool s_loadWorldMapHooked = false;
+
+static void __cdecl RE_LoadWorldMap_RmxHook(const char* mapName)
+{
+    rmx_begin_loading_map(mapName);
+    s_originalRELoadWorldMap(mapName);
+}
+
+static void install_load_world_map_hook()
+{
+    LONG status;
+
+    if (s_loadWorldMapHooked)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRELoadWorldMap,
+                              RE_LoadWorldMap_RmxHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_loadWorldMapHooked = true;
+        RendererLogPrintf("RE_LoadWorldMap Remix hook installed at %p\n",
+                          (void*)RE_LoadWorldMap);
+    }
+    else
+    {
+        s_originalRELoadWorldMap = RE_LoadWorldMap;
+        RendererLogPrintf("WARN: failed to install RE_LoadWorldMap Remix hook: %ld\n",
+                          status);
+    }
+}
+
+static void uninstall_load_world_map_hook()
+{
+    LONG status;
+
+    if (!s_loadWorldMapHooked)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRELoadWorldMap,
+                              RE_LoadWorldMap_RmxHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove RE_LoadWorldMap Remix hook: %ld\n",
+                          status);
+
+    s_originalRELoadWorldMap = RE_LoadWorldMap;
+    s_loadWorldMapHooked = false;
+}
+
+/*
+ * R_Register runs after the renderer has received ri, so it is the earliest
+ * safe point to add a game-console command.  RE_Shutdown removes the command
+ * while the import table is still valid; this also supports renderer restarts
+ * without leaving a callback into an unloaded module.
+ */
+typedef void (__cdecl *RRegisterFn)(void);
+typedef void (__cdecl *REShutdownFn)(int destroyWindow);
+static RRegisterFn s_originalRRegister = R_Register;
+static REShutdownFn s_originalREShutdown = RE_Shutdown;
+static bool s_flashlightCommandHooksInstalled = false;
+static bool s_flashlightCommandRegistered = false;
+static const char s_flashlightToggleCommand[] = "rmx_flashlight_toggle";
+
+static void __cdecl R_Register_FlashlightCommandHook(void)
+{
+    s_originalRRegister();
+
+    if (ri.Cvar_Get)
+    {
+        r_rmx_coronas = (cvar_t*)ri.Cvar_Get(
+            "rmx_coronas", "0", CVAR_ARCHIVE);
+        r_rmx_dynamiclight = (cvar_t*)ri.Cvar_Get(
+            "rmx_dynamiclight", "1", CVAR_ARCHIVE);
+    }
+
+    if (!s_flashlightCommandRegistered && ri.Cmd_AddCommand)
+    {
+        ri.Cmd_AddCommand(s_flashlightToggleCommand, a1_flashlight_toggle);
+        s_flashlightCommandRegistered = true;
+    }
+}
+
+static void __cdecl RE_Shutdown_FlashlightCommandHook(int destroyWindow)
+{
+    if (s_flashlightCommandRegistered && ri.Cmd_RemoveCommand)
+    {
+        ri.Cmd_RemoveCommand(s_flashlightToggleCommand);
+        s_flashlightCommandRegistered = false;
+    }
+
+    s_originalREShutdown(destroyWindow);
+}
+
+static void install_flashlight_command_hooks()
+{
+    LONG status;
+
+    if (s_flashlightCommandHooksInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRRegister,
+                              R_Register_FlashlightCommandHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalREShutdown,
+                              RE_Shutdown_FlashlightCommandHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_flashlightCommandHooksInstalled = true;
+        RendererLogPrintf("Flashlight command lifecycle hooks installed\n");
+    }
+    else
+    {
+        s_originalRRegister = R_Register;
+        s_originalREShutdown = RE_Shutdown;
+        RendererLogPrintf("WARN: failed to install flashlight command lifecycle hooks: %ld\n",
+                          status);
+    }
+}
+
+static void uninstall_flashlight_command_hooks()
+{
+    LONG status;
+
+    if (!s_flashlightCommandHooksInstalled)
+        return;
+
+    if (s_flashlightCommandRegistered && ri.Cmd_RemoveCommand)
+    {
+        ri.Cmd_RemoveCommand(s_flashlightToggleCommand);
+        s_flashlightCommandRegistered = false;
+    }
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalREShutdown,
+                              RE_Shutdown_FlashlightCommandHook);
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRRegister,
+                              R_Register_FlashlightCommandHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove flashlight command lifecycle hooks: %ld\n",
+                          status);
+
+    s_originalRRegister = R_Register;
+    s_originalREShutdown = RE_Shutdown;
+    s_flashlightCommandHooksInstalled = false;
+}
+
+/*
+ * Alice exposes dynamic-light submission as RE_AddLightToScene.  Its final
+ * integer parameter is renderer-specific, but it is preserved verbatim when
+ * continuing into the original function.
+ */
+typedef void (__cdecl *REAddLightToSceneFn)(const vec3_t org, float intensity,
+                                            float r, float g, float b, int type);
+typedef void (__cdecl *REAddRefEntityToSceneFn)(const refEntity_t* ent);
+typedef void (__cdecl *REBeginFrameFn)(int stereoFrame);
+static REAddLightToSceneFn s_originalREAddLightToScene = RE_AddLightToScene;
+static REAddRefEntityToSceneFn s_originalREAddRefEntityToScene = RE_AddRefEntityToScene;
+static REBeginFrameFn s_originalREBeginFrame = RE_BeginFrame;
+static bool s_rmxDynamicLightHooksInstalled = false;
+
+static void __cdecl RE_AddLightToScene_RmxHook(const vec3_t org, float intensity,
+                                                float r, float g, float b, int type)
+{
+    if (r_rmx_dynamiclight && r_rmx_dynamiclight->value)
+    {
+        vec3_t color = { r, g, b };
+        rmx_light_add(LIGHT_DYNAMIC, (int)r_rmxdlights, org, org, color, intensity);
+        ++r_rmxdlights;
+    }
+
+    s_originalREAddLightToScene(org, intensity, r, g, b, type);
+}
+
+/* R_DrawLensFlares identifies static torch/lamp candidates by renderfx bit 3. */
+static void __cdecl RE_AddRefEntityToScene_RmxCoronaHook(const refEntity_t* ent)
+{
+    if (ent && r_rmx_coronas && r_rmx_coronas->value && (ent->renderfx & 0x8))
+    {
+        const byte* rgba = (const byte*)ent + 0xbc;
+        vec3_t color = {
+            rgba[0] / 255.0f,
+            rgba[1] / 255.0f,
+            rgba[2] / 255.0f
+        };
+
+        rmx_light_add(LIGHT_CORONA, (int)r_rmxcoronas,
+                      ent->origin, ent->origin, color, 0.0f);
+        ++r_rmxcoronas;
+    }
+
+    s_originalREAddRefEntityToScene(ent);
+}
+
+static void __cdecl RE_BeginFrame_RmxHook(int stereoFrame)
+{
+    r_rmxdlights = 0;
+    r_rmxcoronas = 0;
+
+    if (r_rmx_dynamiclight && r_rmx_dynamiclight->modified)
+    {
+        r_rmx_dynamiclight->modified = qfalse;
+        rmx_lights_clear(LIGHT_DYNAMIC);
+    }
+
+    if (r_rmx_coronas && r_rmx_coronas->modified)
+    {
+        r_rmx_coronas->modified = qfalse;
+        rmx_lights_clear(LIGHT_CORONA);
+    }
+
+    s_originalREBeginFrame(stereoFrame);
+}
+
+static void install_rmx_dynamic_light_hooks()
+{
+    LONG status;
+
+    if (s_rmxDynamicLightHooksInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalREAddLightToScene,
+                              RE_AddLightToScene_RmxHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalREAddRefEntityToScene,
+                              RE_AddRefEntityToScene_RmxCoronaHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalREBeginFrame,
+                              RE_BeginFrame_RmxHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_rmxDynamicLightHooksInstalled = true;
+        RendererLogPrintf("Remix dynamic-light/corona hooks installed\n");
+    }
+    else
+    {
+        s_originalREAddLightToScene = RE_AddLightToScene;
+        s_originalREAddRefEntityToScene = RE_AddRefEntityToScene;
+        s_originalREBeginFrame = RE_BeginFrame;
+        RendererLogPrintf("WARN: failed to install Remix dynamic-light/corona hooks: %ld\n",
+                          status);
+    }
+}
+
+static void uninstall_rmx_dynamic_light_hooks()
+{
+    LONG status;
+
+    if (!s_rmxDynamicLightHooksInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalREBeginFrame,
+                              RE_BeginFrame_RmxHook);
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalREAddRefEntityToScene,
+                              RE_AddRefEntityToScene_RmxCoronaHook);
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalREAddLightToScene,
+                              RE_AddLightToScene_RmxHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove Remix dynamic-light/corona hooks: %ld\n",
+                          status);
+
+    s_originalREAddLightToScene = RE_AddLightToScene;
+    s_originalREAddRefEntityToScene = RE_AddRefEntityToScene;
+    s_originalREBeginFrame = RE_BeginFrame;
+    r_rmx_coronas = nullptr;
+    r_rmx_dynamiclight = nullptr;
+    r_rmxdlights = 0;
+    r_rmxcoronas = 0;
+    s_rmxDynamicLightHooksInstalled = false;
+}
+
+/* Feed Remix the renderer's active 3D camera before Alice consumes the view. */
+typedef void (__cdecl *RERenderSceneFn)(const refdef_t* fd);
+static RERenderSceneFn s_originalRERenderScene = RE_RenderScene;
+static bool s_rmxCameraHookInstalled = false;
+
+static void __cdecl RE_RenderScene_RmxCameraHook(const refdef_t* fd)
+{
+    static const float identity[9] = { 1.0f, 0.0f, 0.0f,
+                                        0.0f, 1.0f, 0.0f,
+                                        0.0f, 0.0f, 1.0f };
+
+    if (fd && memcmp(identity, fd->viewaxis, sizeof(identity)) != 0)
+        rmx_setplayerpos(fd->vieworg, fd->viewaxis[0]);
+
+    s_originalRERenderScene(fd);
+}
+
+static void install_rmx_camera_hook()
+{
+    LONG status;
+
+    if (s_rmxCameraHookInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRERenderScene,
+                              RE_RenderScene_RmxCameraHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_rmxCameraHookInstalled = true;
+        RendererLogPrintf("Remix camera hook installed\n");
+    }
+    else
+    {
+        s_originalRERenderScene = RE_RenderScene;
+        RendererLogPrintf("WARN: failed to install Remix camera hook: %ld\n", status);
+    }
+}
+
+static void uninstall_rmx_camera_hook()
+{
+    LONG status;
+
+    if (!s_rmxCameraHookInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRERenderScene,
+                              RE_RenderScene_RmxCameraHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove Remix camera hook: %ld\n", status);
+
+    s_originalRERenderScene = RE_RenderScene;
+    s_rmxCameraHookInstalled = false;
 }
 
 /*
@@ -1307,6 +1743,10 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         s_opengl32 = LoadLibrary("opengl32");
         logInit();
         rmx_interface_init(s_opengl32);
+        install_load_world_map_hook();
+        install_flashlight_command_hooks();
+        install_rmx_dynamic_light_hooks();
+        install_rmx_camera_hook();
         install_sepia_screenshot_fix();
         install_console_fix();
         patch_running_from_alice2();
@@ -1319,6 +1759,10 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_getrefapi();
         break;
     case DLL_PROCESS_DETACH:
+        uninstall_rmx_camera_hook();
+        uninstall_rmx_dynamic_light_hooks();
+        uninstall_flashlight_command_hooks();
+        uninstall_load_world_map_hook();
         uninstall_remix_shader_hooks();
         uninstall_vertex_lighting_mode_hook();
         uninstall_stable_draw_surf_sort();
@@ -1338,6 +1782,13 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         break;
     }
     return TRUE;
+}
+
+static void QDECL a1_flashlight_toggle(void)
+{
+	rmx_flashlight_enable(-1);
+	//play a switch sound
+	ri.Cmd_ExecuteText(EXEC_APPEND, "play sound/ambience/special/padlock1.wav");
 }
 
 #define STRINGIFY(x) #x
