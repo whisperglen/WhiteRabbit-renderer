@@ -14,6 +14,7 @@
 #define EXEC_APPEND 2
 
 extern "C" refimport_t ri;
+extern "C" byte tess[];
 
 extern "C" void* __cdecl GetRefAPI(int apiVersion, void* imports);
 extern "C" void GLW_GetValidModes();
@@ -34,6 +35,10 @@ extern "C" void RE_AddLightToScene(const vec3_t org, float intensity,
 extern "C" void RE_AddRefEntityToScene(const refEntity_t* ent);
 extern "C" void RE_BeginFrame(int stereoFrame);
 extern "C" void RE_RenderScene(const refdef_t* fd);
+extern "C" void RB_BeginSurface(void* shader, void* fog);
+extern "C" void RB_SurfaceFace(void* surface);
+extern "C" void RB_SurfaceGrid(void* surface);
+extern "C" void RB_SurfaceTriangles(void* surface);
 extern "C" void RendererInitSkyPortalOptions(void);
 extern "C" void RendererInitRemixShaderOptions(void);
 extern "C" void __cdecl RemixComputeColorsHook(void* stage);
@@ -92,6 +97,18 @@ static uint32_t r_rmxcoronas = 0;
 
 static HMODULE s_rendererModule = nullptr;
 static HMODULE s_opengl32 = nullptr;
+
+/* shaderCommands_t field offsets, recovered from the tessellation writers. */
+static const size_t TESS_VERTEXES_OFFSET = 0xAFC80;
+static const size_t TESS_NORMALS_OFFSET = 0x124F80;
+
+static void log_tess_array_addresses()
+{
+    RendererLogPrintf("Remix tess arrays: tess.vertexes=%p, tess.normal=%p (normal delta +0x%X)\n",
+                      tess + TESS_VERTEXES_OFFSET,
+                      tess + TESS_NORMALS_OFFSET,
+                      (unsigned int)(TESS_NORMALS_OFFSET - TESS_VERTEXES_OFFSET));
+}
 
 /*
  * Keep the renderer's original GetRefAPI as the call target, but interpose the
@@ -513,6 +530,143 @@ static void uninstall_rmx_camera_hook()
 
     s_originalRERenderScene = RE_RenderScene;
     s_rmxCameraHookInstalled = false;
+}
+
+/*
+ * RB_SurfaceFace, RB_SurfaceGrid, and RB_SurfaceTriangles all populate
+ * tess.normal when shader->needsNormal is set.  Face expands its plane normal
+ * per vertex; grid and triangles copy their source vertex normals.  Cache the
+ * active shader at RB_BeginSurface, then force only this tessellation gate
+ * while those static-surface handlers execute.
+ */
+typedef void (__cdecl *RBBeginSurfaceFn)(void* shader, void* fog);
+typedef void (__cdecl *RBSurfaceFn)(void* surface);
+static RBBeginSurfaceFn s_originalRBBeginSurface = RB_BeginSurface;
+static RBSurfaceFn s_originalRBSurfaceFace = RB_SurfaceFace;
+static RBSurfaceFn s_originalRBSurfaceGrid = RB_SurfaceGrid;
+static RBSurfaceFn s_originalRBSurfaceTriangles = RB_SurfaceTriangles;
+static void* s_activeTessShader = nullptr;
+static bool s_staticSurfaceNormalHooksInstalled = false;
+static const size_t SHADER_NEEDS_NORMAL_OFFSET = 0xbc;
+
+static void __cdecl RB_BeginSurface_NormalCaptureHook(void* shader, void* fog)
+{
+    s_activeTessShader = shader;
+    s_originalRBBeginSurface(shader, fog);
+}
+
+static void force_static_surface_normals(RBSurfaceFn original, void* surface)
+{
+    int* needsNormal = s_activeTessShader
+        ? (int*)((byte*)s_activeTessShader + SHADER_NEEDS_NORMAL_OFFSET)
+        : nullptr;
+    int previousNeedsNormal = needsNormal ? *needsNormal : 0;
+
+    if (needsNormal)
+        *needsNormal = qtrue;
+
+    original(surface);
+
+    if (needsNormal)
+        *needsNormal = previousNeedsNormal;
+}
+
+static void __cdecl RB_SurfaceFace_NormalHook(void* surface)
+{
+    force_static_surface_normals(s_originalRBSurfaceFace, surface);
+}
+
+static void __cdecl RB_SurfaceGrid_NormalHook(void* surface)
+{
+    force_static_surface_normals(s_originalRBSurfaceGrid, surface);
+}
+
+static void __cdecl RB_SurfaceTriangles_NormalHook(void* surface)
+{
+    force_static_surface_normals(s_originalRBSurfaceTriangles, surface);
+}
+
+static void install_static_surface_normal_hooks()
+{
+    LONG status;
+
+    if (s_staticSurfaceNormalHooksInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRBBeginSurface,
+                              RB_BeginSurface_NormalCaptureHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRBSurfaceFace,
+                              RB_SurfaceFace_NormalHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRBSurfaceGrid,
+                              RB_SurfaceGrid_NormalHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRBSurfaceTriangles,
+                              RB_SurfaceTriangles_NormalHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_staticSurfaceNormalHooksInstalled = true;
+        RendererLogPrintf("Static surface normal hooks installed\n");
+    }
+    else
+    {
+        s_originalRBBeginSurface = RB_BeginSurface;
+        s_originalRBSurfaceFace = RB_SurfaceFace;
+        s_originalRBSurfaceGrid = RB_SurfaceGrid;
+        s_originalRBSurfaceTriangles = RB_SurfaceTriangles;
+        s_activeTessShader = nullptr;
+        RendererLogPrintf("WARN: failed to install static surface normal hooks: %ld\n",
+                          status);
+    }
+}
+
+static void uninstall_static_surface_normal_hooks()
+{
+    LONG status;
+
+    if (!s_staticSurfaceNormalHooksInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRBSurfaceTriangles,
+                              RB_SurfaceTriangles_NormalHook);
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRBSurfaceGrid,
+                              RB_SurfaceGrid_NormalHook);
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRBSurfaceFace,
+                              RB_SurfaceFace_NormalHook);
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRBBeginSurface,
+                              RB_BeginSurface_NormalCaptureHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove static surface normal hooks: %ld\n",
+                          status);
+
+    s_originalRBBeginSurface = RB_BeginSurface;
+    s_originalRBSurfaceFace = RB_SurfaceFace;
+    s_originalRBSurfaceGrid = RB_SurfaceGrid;
+    s_originalRBSurfaceTriangles = RB_SurfaceTriangles;
+    s_activeTessShader = nullptr;
+    s_staticSurfaceNormalHooksInstalled = false;
 }
 
 /*
@@ -1742,11 +1896,13 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         s_rendererModule = hModule;
         s_opengl32 = LoadLibrary("opengl32");
         logInit();
+        log_tess_array_addresses();
         rmx_interface_init(s_opengl32);
         install_load_world_map_hook();
         install_flashlight_command_hooks();
         install_rmx_dynamic_light_hooks();
         install_rmx_camera_hook();
+        install_static_surface_normal_hooks();
         install_sepia_screenshot_fix();
         install_console_fix();
         patch_running_from_alice2();
@@ -1759,6 +1915,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_getrefapi();
         break;
     case DLL_PROCESS_DETACH:
+        uninstall_static_surface_normal_hooks();
         uninstall_rmx_camera_hook();
         uninstall_rmx_dynamic_light_hooks();
         uninstall_flashlight_command_hooks();

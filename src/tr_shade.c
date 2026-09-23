@@ -94,7 +94,7 @@ void RendererInitRemixShaderOptions(void)
             "r_environmentMapping", "1", CVAR_ARCHIVE);
 
     RendererLogPrintf("Remix shader options: r_novertex_colors=%d, "
-                      "r_turbulentTextures=%d, r_environmentMapping=%d, ",
+                      "r_turbulentTextures=%d, r_environmentMapping=%d \n",
                       s_noVertexColors ? s_noVertexColors->integer : -1,
                       s_turbulentTextures ? s_turbulentTextures->integer : -1,
                       s_environmentMapping ? s_environmentMapping->integer : -1);
