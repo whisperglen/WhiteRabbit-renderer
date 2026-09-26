@@ -66,7 +66,38 @@ extern "C" void __cdecl RendererShutdownStableDrawSurfSort(void);
 static const uintptr_t EXE_Z_FREE = 0x0041E000;
 
 typedef void (APIENTRY *QglPixelStoreiFn)(unsigned int pname, int param);
+typedef void (APIENTRY *QglGetIntegervFn)(unsigned int pname, int* values);
+typedef unsigned char (APIENTRY *QglIsEnabledFn)(unsigned int cap);
+typedef void (APIENTRY *QglActiveTextureFn)(unsigned int texture);
+typedef void (APIENTRY *QglBindTextureFn)(unsigned int target, unsigned int texture);
+typedef void (APIENTRY *QglGenTexturesFn)(int count, unsigned int* textures);
+typedef void (APIENTRY *QglDeleteTexturesFn)(int count, const unsigned int* textures);
+typedef void (APIENTRY *QglTexParameteriFn)(unsigned int target, unsigned int pname,
+                                             int param);
+typedef void (APIENTRY *QglTexImage2DFn)(unsigned int target, int level,
+                                         int internalFormat, int width, int height,
+                                         int border, unsigned int format,
+                                         unsigned int type, const void* pixels);
+typedef void (APIENTRY *QglEnableDisableFn)(unsigned int cap);
+typedef void (APIENTRY *QglBeginFn)(unsigned int mode);
+typedef void (APIENTRY *QglEndFn)(void);
+typedef void (APIENTRY *QglTexCoord2fFn)(float s, float t);
+typedef void (APIENTRY *QglVertex2fFn)(float x, float y);
 extern "C" QglPixelStoreiFn qglPixelStorei;
+extern "C" QglGetIntegervFn qglGetIntegerv;
+extern "C" QglIsEnabledFn qglIsEnabled;
+extern "C" QglActiveTextureFn qglActiveTextureARB;
+extern "C" QglBindTextureFn qglBindTexture;
+extern "C" QglGenTexturesFn qglGenTextures;
+extern "C" QglDeleteTexturesFn qglDeleteTextures;
+extern "C" QglTexParameteriFn qglTexParameteri;
+extern "C" QglTexImage2DFn qglTexImage2D;
+extern "C" QglEnableDisableFn qglEnable;
+extern "C" QglEnableDisableFn qglDisable;
+extern "C" QglBeginFn qglBegin;
+extern "C" QglEndFn qglEnd;
+extern "C" QglTexCoord2fFn qglTexCoord2f;
+extern "C" QglVertex2fFn qglVertex2f;
 
 static void logInit();
 static void logClose();
@@ -108,6 +139,129 @@ static void log_tess_array_addresses()
                       tess + TESS_VERTEXES_OFFSET,
                       tess + TESS_NORMALS_OFFSET,
                       (unsigned int)(TESS_NORMALS_OFFSET - TESS_VERTEXES_OFFSET));
+}
+
+/*
+ * Remix switches permanently to its UI path after its first orthographic,
+ * no-depth-write draw of a frame.  Alice prepares 2D state, then begins each
+ * HUD element through RE_RenderScene.  Emit one marker just before the first
+ * HUD RE_RenderScene, while that 2D state is still active.
+ */
+static const unsigned int GL_TEXTURE_2D_VALUE = 0x0de1;
+static const unsigned int GL_TEXTURE0_ARB_VALUE = 0x84c0;
+static const unsigned int GL_ACTIVE_TEXTURE_ARB_VALUE = 0x84e0;
+static const unsigned int GL_TEXTURE_BINDING_2D_VALUE = 0x8069;
+static const unsigned int GL_TEXTURE_MIN_FILTER_VALUE = 0x2801;
+static const unsigned int GL_TEXTURE_MAG_FILTER_VALUE = 0x2800;
+static const unsigned int GL_NEAREST_VALUE = 0x2600;
+static const unsigned int GL_RGBA_VALUE = 0x1908;
+static const unsigned int GL_UNSIGNED_BYTE_VALUE = 0x1401;
+static const unsigned int GL_QUADS_VALUE = 0x0007;
+
+static unsigned int s_uiMarkerTexture = 0;
+static bool s_uiMarkerEmittedThisFrame = false;
+
+static bool ui_marker_qgl_ready()
+{
+    return qglGetIntegerv && qglIsEnabled && qglActiveTextureARB &&
+           qglBindTexture && qglGenTextures && qglTexParameteri &&
+           qglTexImage2D && qglEnable && qglDisable && qglBegin && qglEnd &&
+           qglTexCoord2f && qglVertex2f;
+}
+
+static bool create_ui_marker_texture()
+{
+    static const byte markerPixels[2 * 2 * 4] = {
+        0xff, 0x00, 0xff, 0xff,
+        0x00, 0xff, 0xff, 0xff,
+        0x00, 0xff, 0xff, 0xff,
+        0xff, 0x00, 0xff, 0xff
+    };
+    int savedActiveTexture;
+    int savedTexture2D;
+    unsigned int markerTexture = 0;
+
+    if (s_uiMarkerTexture)
+        return true;
+    if (!ui_marker_qgl_ready())
+        return false;
+
+    qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
+    qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    qglGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &savedTexture2D);
+
+    qglGenTextures(1, &markerTexture);
+    if (markerTexture)
+    {
+        qglBindTexture(GL_TEXTURE_2D_VALUE, markerTexture);
+        qglTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_MIN_FILTER_VALUE,
+                          GL_NEAREST_VALUE);
+        qglTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_MAG_FILTER_VALUE,
+                          GL_NEAREST_VALUE);
+        qglTexImage2D(GL_TEXTURE_2D_VALUE, 0, GL_RGBA_VALUE, 2, 2, 0,
+                      GL_RGBA_VALUE, GL_UNSIGNED_BYTE_VALUE, markerPixels);
+        s_uiMarkerTexture = markerTexture;
+    }
+
+    qglBindTexture(GL_TEXTURE_2D_VALUE, (unsigned int)savedTexture2D);
+    qglActiveTextureARB((unsigned int)savedActiveTexture);
+
+    if (!s_uiMarkerTexture)
+        return false;
+
+    RendererLogPrintf("Remix UI marker texture created: %u\n", s_uiMarkerTexture);
+    return true;
+}
+
+static bool emit_ui_marker_draw()
+{
+    int savedActiveTexture;
+    int savedTexture2D;
+    unsigned char texture2DWasEnabled;
+
+    if (!create_ui_marker_texture())
+        return false;
+
+    qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
+    qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    qglGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &savedTexture2D);
+    texture2DWasEnabled = qglIsEnabled(GL_TEXTURE_2D_VALUE);
+
+    qglEnable(GL_TEXTURE_2D_VALUE);
+    qglBindTexture(GL_TEXTURE_2D_VALUE, s_uiMarkerTexture);
+    qglBegin(GL_QUADS_VALUE);
+    qglTexCoord2f(0.0f, 0.0f); qglVertex2f(0.0f, 0.0f);
+    qglTexCoord2f(1.0f, 0.0f); qglVertex2f(64.0f, 0.0f);
+    qglTexCoord2f(1.0f, 1.0f); qglVertex2f(64.0f, 64.0f);
+    qglTexCoord2f(0.0f, 1.0f); qglVertex2f(0.0f, 64.0f);
+    qglEnd();
+
+    qglBindTexture(GL_TEXTURE_2D_VALUE, (unsigned int)savedTexture2D);
+    if (!texture2DWasEnabled)
+        qglDisable(GL_TEXTURE_2D_VALUE);
+    qglActiveTextureARB((unsigned int)savedActiveTexture);
+    return true;
+}
+
+static void destroy_ui_marker_texture()
+{
+    int savedActiveTexture;
+    int savedTexture2D;
+    unsigned int markerTexture = s_uiMarkerTexture;
+
+    s_uiMarkerTexture = 0;
+    s_uiMarkerEmittedThisFrame = false;
+    if (!markerTexture || !qglGetIntegerv || !qglActiveTextureARB ||
+        !qglBindTexture || !qglDeleteTextures)
+        return;
+
+    qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
+    qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    qglGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &savedTexture2D);
+    qglDeleteTextures(1, &markerTexture);
+    if ((unsigned int)savedTexture2D != markerTexture)
+        qglBindTexture(GL_TEXTURE_2D_VALUE, (unsigned int)savedTexture2D);
+    qglActiveTextureARB((unsigned int)savedActiveTexture);
 }
 
 /*
@@ -236,6 +390,8 @@ static void __cdecl R_Register_FlashlightCommandHook(void)
 
 static void __cdecl RE_Shutdown_FlashlightCommandHook(int destroyWindow)
 {
+    destroy_ui_marker_texture();
+
     if (s_flashlightCommandRegistered && ri.Cmd_RemoveCommand)
     {
         ri.Cmd_RemoveCommand(s_flashlightToggleCommand);
@@ -367,6 +523,7 @@ static void __cdecl RE_BeginFrame_RmxHook(int stereoFrame)
 {
     r_rmxdlights = 0;
     r_rmxcoronas = 0;
+    s_uiMarkerEmittedThisFrame = false;
 
     if (r_rmx_dynamiclight && r_rmx_dynamiclight->modified)
     {
@@ -473,6 +630,13 @@ static void __cdecl RE_RenderScene_RmxCameraHook(const refdef_t* fd)
 
     if (fd && memcmp(identity, fd->viewaxis, sizeof(identity)) != 0)
         rmx_setplayerpos(fd->vieworg, fd->viewaxis[0]);
+
+    /* HUD refdefs use a negative x viewport; world refdefs begin at x == 0. */
+    if (!s_uiMarkerEmittedThisFrame && fd && fd->rdflags != 0 && emit_ui_marker_draw())
+    {
+        s_uiMarkerEmittedThisFrame = true;
+        //RendererLogPrintf("Remix UI marker emitted before HUD RE_RenderScene\n");
+    }
 
     s_originalRERenderScene(fd);
 }
