@@ -1,0 +1,318 @@
+From 98b53731bb89f9221a95666146ebd85ac2298f56 Mon Sep 17 00:00:00 2001
+From: whisperglen <whisperglen45@gmail.com>
+Date: Wed, 13 May 2026 16:13:39 +0300
+Subject: [PATCH] GPU Texture UV transforms
+
+---
+ code/rd-vanilla/tr_init.cpp       |  2 +
+ code/rd-vanilla/tr_local.h        |  3 +
+ code/rd-vanilla/tr_shade.cpp      | 97 ++++++++++++++++++++++++++++++-
+ code/rd-vanilla/tr_shade_calc.cpp | 75 +++++++++++++++++++-----
+ 4 files changed, 162 insertions(+), 15 deletions(-)
+
+diff --git a/code/rd-vanilla/tr_init.cpp b/code/rd-vanilla/tr_init.cpp
+index 21442905..bdafb736 100644
+--- a/code/rd-vanilla/tr_init.cpp
++++ b/code/rd-vanilla/tr_init.cpp
+@@ -186,6 +186,7 @@ cvar_t	*r_environmentMapping;
+ cvar_t *r_screenshotJpegQuality;
+ 
+ cvar_t  *r_novertex_colors;
++cvar_t  *r_gpu_uv_transform;
+ 
+ #if !defined(__APPLE__)
+ PFNGLSTENCILOPSEPARATEPROC qglStencilOpSeparate;
+@@ -1686,6 +1687,7 @@ Ghoul2 Insert End
+ 	ri.Cvar_CheckRange( r_screenshotJpegQuality, 10, 100, qtrue );
+ 
+ 	r_novertex_colors = ri.Cvar_Get( "r_novertex_colors", "0", CVAR_ARCHIVE );
++	r_gpu_uv_transform = ri.Cvar_Get("r_gpu_uv_transform", "0", CVAR_ARCHIVE);
+ 
+ 	for ( size_t i = 0; i < numCommands; i++ )
+ 		ri.Cmd_AddCommand( commands[i].cmd, commands[i].func );
+diff --git a/code/rd-vanilla/tr_local.h b/code/rd-vanilla/tr_local.h
+index 7a522562..31077271 100644
+--- a/code/rd-vanilla/tr_local.h
++++ b/code/rd-vanilla/tr_local.h
+@@ -1223,6 +1223,7 @@ Ghoul2 Insert End
+ extern	cvar_t	*r_environmentMapping;
+ 
+ extern  cvar_t  *r_novertex_colors;
++extern  cvar_t  *r_gpu_uv_transform;
+ //====================================================================
+ 
+ 
+@@ -1464,6 +1465,8 @@ void RB_AddQuadStampExt( vec3_t origin, vec3_t left, vec3_t up, byte *color, flo
+ 
+ void RB_ShowImages( void );
+ 
++void RB_MultiplyTextureMatrix(float* mat);
++
+ /*
+ ============================================================
+ 
+diff --git a/code/rd-vanilla/tr_shade.cpp b/code/rd-vanilla/tr_shade.cpp
+index 5536d66e..ce99decd 100644
+--- a/code/rd-vanilla/tr_shade.cpp
++++ b/code/rd-vanilla/tr_shade.cpp
+@@ -1665,6 +1665,71 @@ static void ComputeColors( shaderStage_t *pStage, alphaGen_t forceAlphaGen, colo
+ 	}
+ }
+ 
++static void ComputeTexCoords_ClearTransforms()
++{
++	if (r_gpu_uv_transform->integer)
++	{
++		GLint matrixMode = 0;
++		GLint activeTexture = -1;
++		qglGetIntegerv(GL_MATRIX_MODE, &matrixMode);
++		qglGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
++
++		qglMatrixMode(GL_TEXTURE);
++
++		for (int i = 0; i < NUM_TEXTURE_BUNDLES; i++)
++		{
++			if(qglActiveTextureARB)
++				qglActiveTextureARB(GL_TEXTURE0_ARB + i);
++			qglLoadIdentity();
++		}
++
++		qglMatrixMode(matrixMode);
++		if(qglActiveTextureARB)
++			qglActiveTextureARB(activeTexture);
++	}
++}
++
++static float g_texcoords_mats[NUM_TEXTURE_BUNDLES][16];
++static int g_texcoords_index = 0;
++
++void RB_MultiplyTextureMatrix(float* mat)
++{
++	float* dest = g_texcoords_mats[g_texcoords_index];
++	const float *A = mat;
++	float B[16];
++
++	memcpy(B, dest, sizeof(B));
++
++	int i, j;
++	for (i = 0; i < 4; i++)
++	{
++		for (j = 0; j < 4; j++)
++		{
++			dest[i * 4 + j] =
++				A[0 * 4 + j] * B[i * 4 + 0] +
++				A[1 * 4 + j] * B[i * 4 + 1] +
++				A[2 * 4 + j] * B[i * 4 + 2] +
++				A[3 * 4 + j] * B[i * 4 + 3];
++		}
++	}
++}
++
++/*
++================
++MatrixIdentity4x4
++
++Clears a 16-element column-major matrix to the Identity matrix.
++================
++*/
++static void RB_TextureMatrixClear()
++{
++	float *m = g_texcoords_mats[g_texcoords_index];
++	m[0] = 1.0f; m[4] = 0.0f; m[8] = 0.0f; m[12] = 0.0f;
++	m[1] = 0.0f; m[5] = 1.0f; m[9] = 0.0f; m[13] = 0.0f;
++	m[2] = 0.0f; m[6] = 0.0f; m[10] = 1.0f; m[14] = 0.0f;
++	m[3] = 0.0f; m[7] = 0.0f; m[11] = 0.0f; m[15] = 1.0f;
++}
++
+ /*
+ ===============
+ ComputeTexCoords
+@@ -1677,6 +1742,11 @@ static void ComputeTexCoords( shaderStage_t *pStage ) {
+ 	for ( b = 0; b < NUM_TEXTURE_BUNDLES; b++ ) {
+ 		int tm;
+ 
++		if (r_gpu_uv_transform->integer)
++		{
++			g_texcoords_index = b;
++			RB_TextureMatrixClear();
++		}
+ 		//
+ 		// generate the texture coordinates
+ 		//
+@@ -1731,7 +1801,7 @@ static void ComputeTexCoords( shaderStage_t *pStage ) {
+ 				memset( tess.svars.texcoords[b], 0, sizeof( float ) * 2 * tess.numVertexes );
+ 			break;
+ 		case TCGEN_BAD:
+-			return;
++			goto compute_tex_end;
+ 		}
+ 
+ 		//
+@@ -1785,6 +1855,29 @@ static void ComputeTexCoords( shaderStage_t *pStage ) {
+ 			}
+ 		}
+ 	}
++
++compute_tex_end:
++	if (r_gpu_uv_transform->integer)
++	{
++		GLint matrixMode = 0;
++		GLint activeTexture = -1;
++
++		qglGetIntegerv(GL_MATRIX_MODE, &matrixMode);
++		qglGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
++
++		qglMatrixMode(GL_TEXTURE);
++
++		for (b = 0; b < NUM_TEXTURE_BUNDLES; b++)
++		{
++			if (qglActiveTextureARB)
++				qglActiveTextureARB(GL_TEXTURE0_ARB + b);
++			qglLoadMatrixf(g_texcoords_mats[b]);
++		}
++
++		qglMatrixMode(matrixMode);
++		if(qglActiveTextureARB)
++			qglActiveTextureARB(activeTexture);
++	}
+ }
+ 
+ void ForceAlpha(unsigned char *dstColors, int TR_ForceEntAlpha)
+@@ -2057,6 +2150,8 @@ static void RB_IterateStagesGeneric( shaderCommands_t *input )
+ 		qglFogfv(GL_FOG_COLOR, fog->parms.color);
+ 	}
+ #endif
++
++	ComputeTexCoords_ClearTransforms();
+ }
+ 
+ /*
+diff --git a/code/rd-vanilla/tr_shade_calc.cpp b/code/rd-vanilla/tr_shade_calc.cpp
+index 5df2dbef..5f3db01a 100644
+--- a/code/rd-vanilla/tr_shade_calc.cpp
++++ b/code/rd-vanilla/tr_shade_calc.cpp
+@@ -825,6 +825,8 @@ void RB_CalcFogTexCoords( float *st ) {
+ 	vec3_t		localVec;
+ 	vec4_t		fogDistanceVector, fogDepthVector;
+ 
++	//if (r_gpu_uv_transform->integer) return;
++
+ 	fog = tr.world->fogs + tess.fogNum;
+ 
+ 	// all fogging distance is based on world Z units
+@@ -906,6 +908,8 @@ void RB_CalcEnvironmentTexCoords( float *st )
+ 	vec3_t		viewer;
+ 	float		d;
+ 
++	//if (r_gpu_uv_transform->integer) return;
++
+ 	v = tess.xyz[0];
+ 	normal = tess.normal[0];
+ 
+@@ -938,6 +942,8 @@ void RB_CalcTurbulentTexCoords( const waveForm_t *wf, float *st )
+ 	int i;
+ 	float now;
+ 
++	//if (r_gpu_uv_transform->integer) return;
++
+ 	now = ( wf->phase + backEnd.refdef.floatTime * wf->frequency );
+ 
+ 	for ( i = 0; i < tess.numVertexes; i++, st += 2 )
+@@ -955,12 +961,25 @@ void RB_CalcTurbulentTexCoords( const waveForm_t *wf, float *st )
+ */
+ void RB_CalcScaleTexCoords( const float scale[2], float *st )
+ {
+-	int i;
++	if(!r_gpu_uv_transform->integer)
++	{
++		int i;
+ 
+-	for ( i = 0; i < tess.numVertexes; i++, st += 2 )
++		for ( i = 0; i < tess.numVertexes; i++, st += 2 )
++		{
++			st[0] *= scale[0];
++			st[1] *= scale[1];
++		}
++	}
++	else
+ 	{
+-		st[0] *= scale[0];
+-		st[1] *= scale[1];
++		float matScale[16] = {
++			scale[0], 0.0f,     0.0f, 0.0f,
++			0.0f,     scale[1], 0.0f, 0.0f,
++			0.0f,     0.0f,     1.0f, 0.0f,
++			0.0f,     0.0f,     0.0f, 1.0f
++		};
++		RB_MultiplyTextureMatrix(matScale);
+ 	}
+ }
+ 
+@@ -981,10 +1000,25 @@ void RB_CalcScrollTexCoords( const float scrollSpeed[2], float *st )
+ 	adjustedScrollS = adjustedScrollS - floor( adjustedScrollS );
+ 	adjustedScrollT = adjustedScrollT - floor( adjustedScrollT );
+ 
+-	for ( i = 0; i < tess.numVertexes; i++, st += 2 )
++	if (!r_gpu_uv_transform->integer)
+ 	{
+-		st[0] += adjustedScrollS;
+-		st[1] += adjustedScrollT;
++		for ( i = 0; i < tess.numVertexes; i++, st += 2 )
++		{
++			st[0] += adjustedScrollS;
++			st[1] += adjustedScrollT;
++		}
++	}
++	else
++	{
++		float ds = adjustedScrollS;
++		float dt = adjustedScrollT;
++		float matScroll[16] = {
++			1.0f, 0.0f, 0.0f, 0.0f,
++			0.0f, 1.0f, 0.0f, 0.0f,
++			0.0f, 0.0f, 1.0f, 0.0f,
++			ds,   dt,   0.0f, 1.0f
++		};
++		RB_MultiplyTextureMatrix(matScroll);
+ 	}
+ }
+ 
+@@ -993,15 +1027,28 @@ void RB_CalcScrollTexCoords( const float scrollSpeed[2], float *st )
+ */
+ void RB_CalcTransformTexCoords( const texModInfo_t *tmi, float *st  )
+ {
+-	int i;
+-
+-	for ( i = 0; i < tess.numVertexes; i++, st += 2 )
++	if (!r_gpu_uv_transform->integer)
+ 	{
+-		float s = st[0];
+-		float t = st[1];
++		int i;
+ 
+-		st[0] = s * tmi->matrix[0][0] + t * tmi->matrix[1][0] + tmi->translate[0];
+-		st[1] = s * tmi->matrix[0][1] + t * tmi->matrix[1][1] + tmi->translate[1];
++		for ( i = 0; i < tess.numVertexes; i++, st += 2 )
++		{
++			float s = st[0];
++			float t = st[1];
++
++			st[0] = s * tmi->matrix[0][0] + t * tmi->matrix[1][0] + tmi->translate[0];
++			st[1] = s * tmi->matrix[0][1] + t * tmi->matrix[1][1] + tmi->translate[1];
++		}
++	}
++	else
++	{
++		float matTransform[16] = {
++			tmi->matrix[0][0], tmi->matrix[0][1], 0.0f, 0.0f,
++			tmi->matrix[1][0], tmi->matrix[1][1], 0.0f, 0.0f,
++			0.0f,              0.0f,              1.0f, 0.0f,
++			tmi->translate[0], tmi->translate[1], 0.0f, 1.0f
++		};
++		RB_MultiplyTextureMatrix(matTransform);
+ 	}
+ }
+ 
+-- 
+2.34.0.windows.1
+

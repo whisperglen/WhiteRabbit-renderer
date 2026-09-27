@@ -45,12 +45,35 @@ extern "C" void __cdecl RemixComputeColorsHook(void* stage);
 extern "C" void __cdecl RemixComputeTexCoordsHook(void* stage);
 extern "C" void __cdecl RemixTurbulentTexCoordsHook(const void* waveform,
                                                       float* destination);
+extern "C" void __cdecl RemixScaleTexCoordsHook(const void* scale,
+                                                  float* destination);
+extern "C" void __cdecl RemixScrollTexCoordsHook(const void* scrollSpeed,
+                                                   float* destination);
+extern "C" void __cdecl RemixOffsetTexCoordsHook(const void* offset,
+                                                   float* destination);
+extern "C" void __cdecl RemixTransformTexCoordsHook(const void* modifier,
+                                                      float* destination);
+extern "C" void __cdecl RemixStageIteratorGenericHook(void);
 extern "C" void __cdecl RendererInitRemixShaderHooks(
     void* originalComputeColors, void* originalComputeTexCoords,
     void* originalTurbulentTexCoords, void* backEndProjection2D);
+extern "C" void __cdecl RendererInitRemixGpuUvTransformHooks(
+    void* originalScaleTexCoords, void* originalScrollTexCoords,
+    void* originalOffsetTexCoords, void* originalTransformTexCoords,
+    void* originalStageIteratorGeneric);
+extern "C" void __cdecl RendererSetRemixShaderTime(int milliseconds);
 extern "C" void __cdecl RendererShutdownRemixShaderHooks(void);
 extern "C" void __cdecl RB_CalcTurbulentTexCoords(const void* waveform,
                                                     float* destination);
+extern "C" void __cdecl RB_CalcScaleTexCoords(const void* scale,
+                                                float* destination);
+extern "C" void __cdecl RB_CalcScrollTexCoords(const void* scrollSpeed,
+                                                 float* destination);
+extern "C" void __cdecl RB_CalcOffsetTexCoords(const void* offset,
+                                                 float* destination);
+extern "C" void __cdecl RB_CalcTransformTexCoords(const void* modifier,
+                                                    float* destination);
+extern "C" void __cdecl RB_StageIteratorGeneric(void);
 extern "C" int __cdecl VertexLightingModeHook(void);
 extern "C" void __cdecl RendererInitVertexLightingModeHook(
     void* unfoggedStages, void* shader, void* rVertexLightSlot,
@@ -633,6 +656,9 @@ static void __cdecl RE_RenderScene_RmxCameraHook(const refdef_t* fd)
 
     if (fd && memcmp(identity, fd->viewaxis, sizeof(identity)) != 0)
         rmx_setplayerpos(fd->vieworg, fd->viewaxis[0]);
+
+    if (fd)
+        RendererSetRemixShaderTime(fd->time);
 
     /* HUD refdefs use a negative x viewport; world refdefs begin at x == 0. */
     if (!s_uiMarkerEmittedThisFrame && fd && fd->rdflags != 0 && emit_ui_marker_draw())
@@ -1779,11 +1805,19 @@ static byte* find_compute_texcoords()
 typedef void (__cdecl *ComputeShaderStageFn)(void* stage);
 typedef void (__cdecl *TurbulentTexCoordsFn)(const void* waveform,
                                               float* destination);
+typedef void (__cdecl *TexcoordsModifierFn)(const void* modifier,
+                                             float* destination);
+typedef void (__cdecl *StageIteratorGenericFn)(void);
 
 static ComputeShaderStageFn s_originalComputeColors = nullptr;
 static ComputeShaderStageFn s_originalComputeTexCoords = nullptr;
 static TurbulentTexCoordsFn s_originalTurbulentTexCoords =
     RB_CalcTurbulentTexCoords;
+static TexcoordsModifierFn s_originalScaleTexCoords = RB_CalcScaleTexCoords;
+static TexcoordsModifierFn s_originalScrollTexCoords = RB_CalcScrollTexCoords;
+static TexcoordsModifierFn s_originalOffsetTexCoords = RB_CalcOffsetTexCoords;
+static TexcoordsModifierFn s_originalTransformTexCoords = RB_CalcTransformTexCoords;
+static StageIteratorGenericFn s_originalStageIteratorGeneric = RB_StageIteratorGeneric;
 static bool s_remixShaderHooksInstalled = false;
 
 static void install_remix_shader_hooks()
@@ -1830,6 +1864,11 @@ static void install_remix_shader_hooks()
     s_originalComputeColors = (ComputeShaderStageFn)computeColors;
     s_originalComputeTexCoords = (ComputeShaderStageFn)computeTexCoords;
     s_originalTurbulentTexCoords = RB_CalcTurbulentTexCoords;
+    s_originalScaleTexCoords = RB_CalcScaleTexCoords;
+    s_originalScrollTexCoords = RB_CalcScrollTexCoords;
+    s_originalOffsetTexCoords = RB_CalcOffsetTexCoords;
+    s_originalTransformTexCoords = RB_CalcTransformTexCoords;
+    s_originalStageIteratorGeneric = RB_StageIteratorGeneric;
 
     status = DetourTransactionBegin();
     if (status == NO_ERROR)
@@ -1844,6 +1883,21 @@ static void install_remix_shader_hooks()
         status = DetourAttach((PVOID*)&s_originalTurbulentTexCoords,
                               RemixTurbulentTexCoordsHook);
     if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalScaleTexCoords,
+                              RemixScaleTexCoordsHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalScrollTexCoords,
+                              RemixScrollTexCoordsHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalOffsetTexCoords,
+                              RemixOffsetTexCoordsHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalTransformTexCoords,
+                              RemixTransformTexCoordsHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalStageIteratorGeneric,
+                              RemixStageIteratorGenericHook);
+    if (status == NO_ERROR)
         status = DetourTransactionCommit();
     else
         DetourTransactionAbort();
@@ -1854,6 +1908,11 @@ static void install_remix_shader_hooks()
         s_originalComputeColors = nullptr;
         s_originalComputeTexCoords = nullptr;
         s_originalTurbulentTexCoords = RB_CalcTurbulentTexCoords;
+        s_originalScaleTexCoords = RB_CalcScaleTexCoords;
+        s_originalScrollTexCoords = RB_CalcScrollTexCoords;
+        s_originalOffsetTexCoords = RB_CalcOffsetTexCoords;
+        s_originalTransformTexCoords = RB_CalcTransformTexCoords;
+        s_originalStageIteratorGeneric = RB_StageIteratorGeneric;
         return;
     }
 
@@ -1861,8 +1920,13 @@ static void install_remix_shader_hooks()
                                  (void*)s_originalComputeTexCoords,
                                  (void*)s_originalTurbulentTexCoords,
                                  (void*)(uintptr_t)projection2DAddress);
+    RendererInitRemixGpuUvTransformHooks((void*)s_originalScaleTexCoords,
+                                         (void*)s_originalScrollTexCoords,
+                                         (void*)s_originalOffsetTexCoords,
+                                         (void*)s_originalTransformTexCoords,
+                                         (void*)s_originalStageIteratorGeneric);
     s_remixShaderHooksInstalled = true;
-    RendererLogPrintf("Remix shader hooks installed: colors %p, texcoords %p, projection2D %p\n",
+    RendererLogPrintf("Remix shader hooks installed: colors %p, texcoords %p, projection2D %p, gpu UV modifiers enabled\n",
                       computeColors, computeTexCoords,
                       (void*)(uintptr_t)projection2DAddress);
 }
@@ -1877,14 +1941,29 @@ static void uninstall_remix_shader_hooks()
         if (status == NO_ERROR)
             status = DetourUpdateThread(GetCurrentThread());
         if (status == NO_ERROR)
-            status = DetourDetach((PVOID*)&s_originalComputeColors,
-                                  RemixComputeColorsHook);
+            status = DetourDetach((PVOID*)&s_originalStageIteratorGeneric,
+                                  RemixStageIteratorGenericHook);
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalTransformTexCoords,
+                                  RemixTransformTexCoordsHook);
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalOffsetTexCoords,
+                                  RemixOffsetTexCoordsHook);
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalScrollTexCoords,
+                                  RemixScrollTexCoordsHook);
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalScaleTexCoords,
+                                  RemixScaleTexCoordsHook);
+        if (status == NO_ERROR)
+            status = DetourDetach((PVOID*)&s_originalTurbulentTexCoords,
+                                  RemixTurbulentTexCoordsHook);
         if (status == NO_ERROR)
             status = DetourDetach((PVOID*)&s_originalComputeTexCoords,
                                   RemixComputeTexCoordsHook);
         if (status == NO_ERROR)
-            status = DetourDetach((PVOID*)&s_originalTurbulentTexCoords,
-                                  RemixTurbulentTexCoordsHook);
+            status = DetourDetach((PVOID*)&s_originalComputeColors,
+                                  RemixComputeColorsHook);
         if (status == NO_ERROR)
             status = DetourTransactionCommit();
         else
@@ -1898,6 +1977,11 @@ static void uninstall_remix_shader_hooks()
     s_originalComputeColors = nullptr;
     s_originalComputeTexCoords = nullptr;
     s_originalTurbulentTexCoords = RB_CalcTurbulentTexCoords;
+    s_originalScaleTexCoords = RB_CalcScaleTexCoords;
+    s_originalScrollTexCoords = RB_CalcScrollTexCoords;
+    s_originalOffsetTexCoords = RB_CalcOffsetTexCoords;
+    s_originalTransformTexCoords = RB_CalcTransformTexCoords;
+    s_originalStageIteratorGeneric = RB_StageIteratorGeneric;
     s_remixShaderHooksInstalled = false;
 }
 
