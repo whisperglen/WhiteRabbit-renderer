@@ -33,6 +33,7 @@
     <ClCompile Include="win_glimp.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="qindie_rmx.h" />
     <ClInclude Include="qtypes.h" />
     <ClInclude Include="alice_renderer_api.h" />
     <ClInclude Include="str.h" />

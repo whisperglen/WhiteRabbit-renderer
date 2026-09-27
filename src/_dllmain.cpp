@@ -133,12 +133,15 @@ static HMODULE s_opengl32 = nullptr;
 static const size_t TESS_VERTEXES_OFFSET = 0xAFC80;
 static const size_t TESS_NORMALS_OFFSET = 0x124F80;
 
-static void log_tess_array_addresses()
+static void configure_tess_array_addresses()
 {
+    void* ptrs[] = { tess + TESS_VERTEXES_OFFSET, tess + TESS_NORMALS_OFFSET };
+
     RendererLogPrintf("Remix tess arrays: tess.vertexes=%p, tess.normal=%p (normal delta +0x%X)\n",
-                      tess + TESS_VERTEXES_OFFSET,
-                      tess + TESS_NORMALS_OFFSET,
+                      ptrs[0], ptrs[1],
                       (unsigned int)(TESS_NORMALS_OFFSET - TESS_VERTEXES_OFFSET));
+
+    qind_global_options_set(OPT_NORMALPTR, ptrs);
 }
 
 /*
@@ -1218,8 +1221,8 @@ static void __cdecl RMarkLeaves_SkyPortalNovisHook()
 
     savedNoVis = rNovis->integer;
     rNovis->integer = 0;
-    if (s_skyPortalNovisTraceCount++ < 16)
-        RendererLogPrintf("Sky portal PVS: temporarily r_novis %d -> 0\n", savedNoVis);
+    //if (s_skyPortalNovisTraceCount++ < 16)
+    //    RendererLogPrintf("Sky portal PVS: temporarily r_novis %d -> 0\n", savedNoVis);
 
     s_originalRMarkLeaves();
     rNovis->integer = savedNoVis;
@@ -2060,8 +2063,8 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         s_rendererModule = hModule;
         s_opengl32 = LoadLibrary("opengl32");
         logInit();
-        log_tess_array_addresses();
         rmx_interface_init(s_opengl32);
+        configure_tess_array_addresses();
         install_load_world_map_hook();
         install_flashlight_command_hooks();
         install_rmx_dynamic_light_hooks();

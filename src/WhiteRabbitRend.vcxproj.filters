@@ -58,6 +58,9 @@
     <ClInclude Include="alice_renderer_api.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="qindie_rmx.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <MASM Include="symbols.asm">
