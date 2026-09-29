@@ -10,9 +10,9 @@ Compile the renderer lib of AMG-A1 HD into a dll
 - added some surface normals (some geometry still shows hard edges)
 - gpu texture transforms (some animated textures are visible in remix, mark them as decals)
 - environment (shininess) maps can be disabled and Ignored (r_environmentMaps 0)
-- turbulent textures animation can be disabled (not sure how helpful; r_turbulentTextures 0)
+- turbulent textures animation can be ~~disabled~~ emulated (r_turbulentTextures 0) this enables some animations in remix
 
 ### TODOs
-- some animated textures still do not render
+- ~~some animated textures still do not render~~ Fixed: with Turbulence emulation + disabled r_ext_texture_env_add
 - r_novis 1 shows all level geometry, I need to implement the AABB fixes from RTCW
 - may need better normals for some surfaces

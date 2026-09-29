@@ -42,15 +42,17 @@
 #define TCGEN_ENVIRONMENT_MAPPED             4
 
 #define TMOD_TRANSFORM                        1
+#define TMOD_TURBULENT                        2
 #define TMOD_SCROLL                           3
 #define TMOD_SCALE                            4
 #define TMOD_STRETCH                          5
 #define TMOD_ROTATE                           6
 #define TMOD_OFFSET                           9
 
-/* cvar_t::integer is at +0x20 in Alice's 32-bit ABI. */
+/* Alice cvar_t::value is +0x1c and ::integer is +0x20. */
 typedef struct renderer_cvar_s {
-    uint8_t reserved[0x20];
+    uint8_t reserved[0x1c];
+    float value;
     int integer;
 } renderer_cvar_t;
 
@@ -91,6 +93,14 @@ typedef struct alice_texmod_s {
     uint32_t rotate;                       /* 0x48 */
 } alice_texmod_t;
 
+typedef struct alice_waveform_s {
+    int function;                           /* 0x00 */
+    float base;                             /* 0x04 */
+    float amplitude;                        /* 0x08 */
+    float phase;                            /* 0x0c */
+    float frequency;                        /* 0x10 */
+} alice_waveform_t;
+
 typedef char alice_texmod_size_must_be_0x4c[
     (sizeof(alice_texmod_t) == 0x4c) ? 1 : -1];
 
@@ -109,7 +119,7 @@ static renderer_cvar_t* s_turbulentTextures;
 static renderer_cvar_t* s_environmentMapping;
 static renderer_cvar_t* s_traceComputeColors;
 static renderer_cvar_t* s_gpuUvTransform;
-static renderer_cvar_t* s_gpuUvTransformSlot0;
+static renderer_cvar_t* s_turbulentScale;
 
 /* The qgl variables belong to Alice's renderer library. */
 extern qgl_get_integerv_fn qglGetIntegerv;
@@ -146,6 +156,11 @@ static void write_int(void* address, int value)
 static int cvar_enabled(const renderer_cvar_t* cvar)
 {
     return cvar && cvar->integer != 0;
+}
+
+static float cvar_value(const renderer_cvar_t* cvar, float defaultValue)
+{
+    return cvar ? cvar->value : defaultValue;
 }
 
 static void matrix_identity(float* matrix)
@@ -259,6 +274,7 @@ static void queue_stage_gpu_texmods(const void* stage)
 
             switch (type)
             {
+            case TMOD_TURBULENT:
             case TMOD_SCALE:
             case TMOD_SCROLL:
             case TMOD_OFFSET:
@@ -310,33 +326,17 @@ static void load_gl_texture_matrices(void)
     int savedMatrixMode;
     int savedActiveTexture;
     int bundle;
-    int sourceBundle = 0;
-    int promoteToSlot0 = cvar_enabled(s_gpuUvTransformSlot0);
 
     if (!qgl_texture_matrix_api_available())
         return;
 
     qglGetIntegerv(GL_MATRIX_MODE, &savedMatrixMode);
     qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB, &savedActiveTexture);
-    if (promoteToSlot0)
-    {
-        for (bundle = 0; bundle < NUM_TEXTURE_BUNDLES; ++bundle)
-        {
-            if (!matrix_is_identity(s_textureMatrices[bundle]))
-            {
-                sourceBundle = bundle;
-                break;
-            }
-        }
-    }
     qglMatrixMode(GL_TEXTURE);
     for (bundle = 0; bundle < NUM_TEXTURE_BUNDLES; ++bundle)
     {
         qglActiveTextureARB(GL_TEXTURE0_ARB + bundle);
-        if (promoteToSlot0 && bundle != 0)
-            qglLoadIdentity();
-        else
-            qglLoadMatrixf(s_textureMatrices[promoteToSlot0 ? sourceBundle : bundle]);
+        qglLoadMatrixf(s_textureMatrices[bundle]);
     }
     qglMatrixMode((unsigned int)savedMatrixMode);
     qglActiveTextureARB((unsigned int)savedActiveTexture);
@@ -349,6 +349,17 @@ static float texture_scroll_fraction(float value)
     float fraction = value - (float)whole;
 
     return fraction < 0.0f ? fraction + 1.0f : fraction;
+}
+
+/* A smooth, periodic sine approximation for the stable turbulence fallback. */
+static float texture_wobble(float cycles)
+{
+    float x = (texture_scroll_fraction(cycles) * 2.0f - 1.0f) * 3.14159265f;
+    float absoluteX = x < 0.0f ? -x : x;
+    float y = 1.27323954f * x - 0.405284735f * x * absoluteX;
+    float absoluteY = y < 0.0f ? -y : y;
+
+    return y + 0.225f * (y * absoluteY - y);
 }
 
 /* Alice uses 0x4996b438 as an entity-relative offset sentinel. */
@@ -390,19 +401,18 @@ void RendererInitRemixShaderOptions(void)
     if (!s_gpuUvTransform)
         s_gpuUvTransform = (renderer_cvar_t*)ri.Cvar_Get(
             "rmx_gpu_uv_transform", "0", CVAR_ARCHIVE);
-    if (!s_gpuUvTransformSlot0)
-        s_gpuUvTransformSlot0 = (renderer_cvar_t*)ri.Cvar_Get(
-            "rmx_gpu_uv_transform_slot0", "0", CVAR_ARCHIVE);
+    if (!s_turbulentScale)
+        s_turbulentScale = (renderer_cvar_t*)ri.Cvar_Get(
+            "r_turbulentScale", "0.05", CVAR_ARCHIVE);
 
     RendererLogPrintf("Remix shader options: r_novertex_colors=%d, "
                       "r_turbulentTextures=%d, r_environmentMapping=%d, "
-                      "rmx_gpu_uv_transform=%d, rmx_gpu_uv_transform_slot0=%d\n",
+                      "rmx_gpu_uv_transform=%d, r_turbulentScale=%.3f\n",
                       s_noVertexColors ? s_noVertexColors->integer : -1,
                       s_turbulentTextures ? s_turbulentTextures->integer : -1,
                       s_environmentMapping ? s_environmentMapping->integer : -1,
                       s_gpuUvTransform ? s_gpuUvTransform->integer : -1,
-                      s_gpuUvTransformSlot0 ?
-                          s_gpuUvTransformSlot0->integer : -1);
+                      cvar_value(s_turbulentScale, -1.0f));
 }
 
 /*
@@ -498,7 +508,9 @@ void __cdecl RemixComputeTexCoordsHook(void* stage)
         int bundle;
 
         for (bundle = 0; bundle < NUM_TEXTURE_BUNDLES; ++bundle)
+        {
             matrix_identity(s_textureMatrices[bundle]);
+        }
         queue_stage_gpu_texmods(stage);
         s_gpuTexcoordsActive = 1;
     }
@@ -521,9 +533,35 @@ void __cdecl RemixComputeTexCoordsHook(void* stage)
 /* Keep the original UVs accumulated before TMOD_TURBULENT and run later mods. */
 void __cdecl RemixTurbulentTexCoordsHook(const void* waveform, float* destination)
 {
+    int bundle = next_gpu_texmod_bundle(TMOD_TURBULENT);
+
     if ((!s_turbulentTextures || cvar_enabled(s_turbulentTextures)) &&
         s_originalTurbulentTexCoords)
+    {
         s_originalTurbulentTexCoords(waveform, destination);
+        return;
+    }
+
+    if (bundle >= 0 && waveform)
+    {
+        const alice_waveform_t* wave = (const alice_waveform_t*)waveform;
+        float now = wave->phase + s_refdefTimeSeconds * wave->frequency;
+        float scaleAmount = cvar_value(s_turbulentScale, 0.05f);
+        float scaleX = 1.0f + texture_wobble(now) * scaleAmount;
+        float scaleY = 1.0f + texture_wobble(now * 0.8f + 0.25f) * scaleAmount;
+        float lateralWobble = texture_wobble(now) * wave->amplitude;
+        const float matrix[16] = {
+            scaleX, 0.0f,  0.0f, 0.0f,
+            0.0f,  scaleY, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.5f * (1.0f - scaleX) + lateralWobble,
+            0.5f * (1.0f - scaleY),
+            0.0f, 1.0f
+        };
+
+        /* Scale around the centre; a later scroll modifier still supplies the fall. */
+        multiply_texture_matrix(bundle, matrix);
+    }
 }
 
 void __cdecl RemixScaleTexCoordsHook(const void* scale, float* destination)
@@ -676,7 +714,7 @@ void RendererShutdownRemixShaderHooks(void)
     s_turbulentTextures = NULL;
     s_environmentMapping = NULL;
     s_gpuUvTransform = NULL;
-    s_gpuUvTransformSlot0 = NULL;
+    s_turbulentScale = NULL;
     s_gpuTexmodEventCount = 0;
     s_gpuTexmodEventIndex = 0;
     s_gpuTexcoordsActive = 0;
