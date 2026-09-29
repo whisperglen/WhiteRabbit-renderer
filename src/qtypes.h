@@ -65,8 +65,8 @@ typedef struct cplane_s {
 	byte	pad[2];
 } cplane_t;
 
-#define DEG2RAD( a ) ( ( (a) * M_PI ) / 180.0F )
-#define RAD2DEG( a ) ( ( (a) * 180.0f ) / M_PI )
+#define DEG2RAD( a ) ( (float)( (a) * M_PI ) / 180.0f )
+#define RAD2DEG( a ) ( (float)( (a) * 180.0f ) / M_PI )
 
 
 // print levels from renderer (FIXME: set up for game / cgame?)

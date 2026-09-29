@@ -734,7 +734,6 @@ void TestStringClass(void)
 str GetCapitalized(const str& value)
 {
     str newValue;
-    size_t i;
 
     if (!value.length()) {
         return "";

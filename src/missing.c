@@ -340,12 +340,12 @@ void AngleVectors( const vec3_t angles, vec3_t forward, vec3_t right, vec3_t up 
 	static float		sr, sp, sy, cr, cp, cy;
 	// static to help MS compiler fp bugs
 
-	angle = angles[ YAW ] * ( M_PI * 2 / 360 );
-	sy = sin( angle );
-	cy = cos( angle );
-	angle = angles[ PITCH ] * ( M_PI * 2 / 360 );
-	sp = sin( angle );
-	cp = cos( angle );
+	angle = angles[ YAW ] * (float)( M_PI * 2 / 360 );
+	sy = sinf( angle );
+	cy = cosf( angle );
+	angle = angles[ PITCH ] * (float)( M_PI * 2 / 360 );
+	sp = sinf( angle );
+	cp = cosf( angle );
 
 	if( forward )
 	{
@@ -355,9 +355,9 @@ void AngleVectors( const vec3_t angles, vec3_t forward, vec3_t right, vec3_t up 
 	}
 	if ( right || up )
 	{
-		angle = angles[ ROLL ] * ( M_PI * 2 / 360 );
-		sr = sin( angle );
-		cr = cos( angle );
+		angle = angles[ ROLL ] * (float)( M_PI * 2 / 360 );
+		sr = sinf( angle );
+		cr = cosf( angle );
 
 		if ( right )
 		{
@@ -379,15 +379,15 @@ void AnglesToAxis( const vec3_t angles, vec3_t axis[3] ) {
 	static float		sr, sp, sy, cr, cp, cy;
 	// static to help MS compiler fp bugs
 
-	angle = angles[ YAW ] * ( M_PI * 2 / 360 );
-	sy = sin( angle );
-	cy = cos( angle );
-	angle = angles[ PITCH ] * ( M_PI * 2 / 360 );
-	sp = sin( angle );
-	cp = cos( angle );
-	angle = angles[ ROLL ] * ( M_PI * 2 / 360 );
-	sr = sin( angle );
-	cr = cos( angle );
+	angle = angles[ YAW ] * (float)( M_PI * 2 / 360 );
+	sy = sinf( angle );
+	cy = cosf( angle );
+	angle = angles[ PITCH ] * (float)( M_PI * 2 / 360 );
+	sp = sinf( angle );
+	cp = cosf( angle );
+	angle = angles[ ROLL ] * (float)( M_PI * 2 / 360 );
+	sr = sinf( angle );
+	cr = cosf( angle );
 
 	axis[ 0 ][ 0 ] = cp*cy;
 	axis[ 0 ][ 1 ] = cp*sy;
@@ -435,7 +435,7 @@ void vectoangles( const vec3_t value1, vec3_t angles ) {
 	}
 	else {
 		//if ( value1[0] ) {
-		yaw = ( atan2 ( value1[1], value1[0] ) * 180 / M_PI );
+		yaw = (float)( atan2 ( value1[1], value1[0] ) * 180 / M_PI );
 		//}
 		//else if ( value1[1] > 0 ) {
 		//	yaw = 90;
@@ -447,8 +447,8 @@ void vectoangles( const vec3_t value1, vec3_t angles ) {
 			yaw += 360;
 		}
 
-		forward = sqrt ( value1[0]*value1[0] + value1[1]*value1[1] );
-		pitch = ( atan2(value1[2], forward) * 180 / M_PI );
+		forward = sqrtf ( value1[0]*value1[0] + value1[1]*value1[1] );
+		pitch = (float)( atan2(value1[2], forward) * 180 / M_PI );
 		if ( pitch < 0 ) {
 			pitch += 360;
 		}
@@ -563,10 +563,10 @@ void RotatePointAroundVector( vec3_t dst, const vec3_t dir, const vec3_t point,
 	zrot[0][0] = zrot[1][1] = zrot[2][2] = 1.0F;
 
 	rad = DEG2RAD( degrees );
-	zrot[0][0] = cos( rad );
-	zrot[0][1] = sin( rad );
-	zrot[1][0] = -sin( rad );
-	zrot[1][1] = cos( rad );
+	zrot[0][0] = cosf( rad );
+	zrot[0][1] = sinf( rad );
+	zrot[1][0] = -sinf( rad );
+	zrot[1][1] = cosf( rad );
 
 	Matrix3x3Multiply( m, zrot, tmpmat );
 	Matrix3x3Multiply( tmpmat, im, rot );
@@ -668,8 +668,8 @@ float RadiusFromBounds( const vec3_t mins, const vec3_t maxs ) {
 	float	a, b;
 
 	for (i=0 ; i<3 ; i++) {
-		a = fabs( mins[i] );
-		b = fabs( maxs[i] );
+		a = fabsf( mins[i] );
+		b = fabsf( maxs[i] );
 		corner[i] = a > b ? a : b;
 	}
 
@@ -808,10 +808,10 @@ void SlerpQuaternion
 		scale1 = t;
 	}
 
-	res[X] = scale0 * from[X] + scale1 * to1[X];
-	res[Y] = scale0 * from[Y] + scale1 * to1[Y];
-	res[Z] = scale0 * from[Z] + scale1 * to1[Z];
-	res[W] = scale0 * from[W] + scale1 * to1[W];
+	res[X] = (float)(scale0 * from[X] + scale1 * to1[X]);
+	res[Y] = (float)(scale0 * from[Y] + scale1 * to1[Y]);
+	res[Z] = (float)(scale0 * from[Z] + scale1 * to1[Z]);
+	res[W] = (float)(scale0 * from[W] + scale1 * to1[W]);
 }
 
 void QuatToMat
@@ -841,17 +841,17 @@ void QuatToMat
 	wy = q[ W ] * y2;
 	wz = q[ W ] * z2;
 
-	m[ 0 ][ 0 ] = 1.0 - ( yy + zz );
+	m[ 0 ][ 0 ] = 1.0f - ( yy + zz );
 	m[ 0 ][ 1 ] = xy - wz;
 	m[ 0 ][ 2 ] = xz + wy;
 
 	m[ 1 ][ 0 ] = xy + wz;
-	m[ 1 ][ 1 ] = 1.0 - ( xx + zz );
+	m[ 1 ][ 1 ] = 1.0f - ( xx + zz );
 	m[ 1 ][ 2 ] = yz - wx;
 
 	m[ 2 ][ 0 ] = xz - wy;
 	m[ 2 ][ 1 ] = yz + wx;
-	m[ 2 ][ 2 ] = 1.0 - ( xx + yy );
+	m[ 2 ][ 2 ] = 1.0f - ( xx + yy );
 }
 
 float NormalizeColor( const vec3_t in, vec3_t out ) {
@@ -878,9 +878,9 @@ float NormalizeColor( const vec3_t in, vec3_t out ) {
 unsigned ColorBytes3 (float r, float g, float b) {
 	unsigned	i;
 
-	( (byte *)&i )[0] = r * 255;
-	( (byte *)&i )[1] = g * 255;
-	( (byte *)&i )[2] = b * 255;
+	( (byte *)&i )[0] = (byte)(r * 255);
+	( (byte *)&i )[1] = (byte)(g * 255);
+	( (byte *)&i )[2] = (byte)(b * 255);
 
 	return i;
 }
@@ -888,10 +888,10 @@ unsigned ColorBytes3 (float r, float g, float b) {
 unsigned ColorBytes4 (float r, float g, float b, float a) {
 	unsigned	i;
 
-	( (byte *)&i )[0] = r * 255;
-	( (byte *)&i )[1] = g * 255;
-	( (byte *)&i )[2] = b * 255;
-	( (byte *)&i )[3] = a * 255;
+	( (byte *)&i )[0] = (byte)(r * 255);
+	( (byte *)&i )[1] = (byte)(g * 255);
+	( (byte *)&i )[2] = (byte)(b * 255);
+	( (byte *)&i )[3] = (byte)(a * 255);
 
 	return i;
 }
