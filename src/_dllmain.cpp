@@ -189,8 +189,8 @@ static bool s_uiMarkerEmittedThisFrame = false;
 
 static bool ui_marker_qgl_ready()
 {
-    return qglGetIntegerv && qglIsEnabled && qglActiveTextureARB &&
-           qglBindTexture && qglGenTextures && qglTexParameteri &&
+    return qglGetIntegerv && qglIsEnabled && qglBindTexture &&
+           qglGenTextures && qglTexParameteri &&
            qglTexImage2D && qglEnable && qglDisable && qglBegin && qglEnd &&
            qglTexCoord2f && qglVertex2f;
 }
@@ -212,8 +212,12 @@ static bool create_ui_marker_texture()
     if (!ui_marker_qgl_ready())
         return false;
 
-    qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
-    qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    savedActiveTexture = GL_TEXTURE0_ARB_VALUE;
+    if (qglActiveTextureARB)
+    {
+        qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
+        qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    }
     qglGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &savedTexture2D);
 
     qglGenTextures(1, &markerTexture);
@@ -230,7 +234,8 @@ static bool create_ui_marker_texture()
     }
 
     qglBindTexture(GL_TEXTURE_2D_VALUE, (unsigned int)savedTexture2D);
-    qglActiveTextureARB((unsigned int)savedActiveTexture);
+    if (qglActiveTextureARB)
+        qglActiveTextureARB((unsigned int)savedActiveTexture);
 
     if (!s_uiMarkerTexture)
         return false;
@@ -248,8 +253,12 @@ static bool emit_ui_marker_draw()
     if (!create_ui_marker_texture())
         return false;
 
-    qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
-    qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    savedActiveTexture = GL_TEXTURE0_ARB_VALUE;
+    if (qglActiveTextureARB)
+    {
+        qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
+        qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    }
     qglGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &savedTexture2D);
     texture2DWasEnabled = qglIsEnabled(GL_TEXTURE_2D_VALUE);
 
@@ -265,7 +274,8 @@ static bool emit_ui_marker_draw()
     qglBindTexture(GL_TEXTURE_2D_VALUE, (unsigned int)savedTexture2D);
     if (!texture2DWasEnabled)
         qglDisable(GL_TEXTURE_2D_VALUE);
-    qglActiveTextureARB((unsigned int)savedActiveTexture);
+    if (qglActiveTextureARB)
+        qglActiveTextureARB((unsigned int)savedActiveTexture);
     return true;
 }
 
@@ -277,17 +287,22 @@ static void destroy_ui_marker_texture()
 
     s_uiMarkerTexture = 0;
     s_uiMarkerEmittedThisFrame = false;
-    if (!markerTexture || !qglGetIntegerv || !qglActiveTextureARB ||
-        !qglBindTexture || !qglDeleteTextures)
+    if (!markerTexture || !qglGetIntegerv || !qglBindTexture ||
+        !qglDeleteTextures)
         return;
 
-    qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
-    qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    savedActiveTexture = GL_TEXTURE0_ARB_VALUE;
+    if (qglActiveTextureARB)
+    {
+        qglGetIntegerv(GL_ACTIVE_TEXTURE_ARB_VALUE, &savedActiveTexture);
+        qglActiveTextureARB(GL_TEXTURE0_ARB_VALUE);
+    }
     qglGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &savedTexture2D);
     qglDeleteTextures(1, &markerTexture);
     if ((unsigned int)savedTexture2D != markerTexture)
         qglBindTexture(GL_TEXTURE_2D_VALUE, (unsigned int)savedTexture2D);
-    qglActiveTextureARB((unsigned int)savedActiveTexture);
+    if (qglActiveTextureARB)
+        qglActiveTextureARB((unsigned int)savedActiveTexture);
 }
 
 /*
@@ -660,7 +675,7 @@ static void __cdecl RE_RenderScene_RmxCameraHook(const refdef_t* fd)
     if (fd)
         RendererSetRemixShaderTime(fd->time);
 
-    /* HUD refdefs use a negative x viewport; world refdefs begin at x == 0. */
+    /* HUD refdefs use a backend Clear Flag which matches rdflags != 0 */
     if (!s_uiMarkerEmittedThisFrame && fd && fd->rdflags != 0 && emit_ui_marker_draw())
     {
         s_uiMarkerEmittedThisFrame = true;
