@@ -125,6 +125,9 @@ extern "C" QglVertex2fFn qglVertex2f;
 static void logInit();
 static void logClose();
 extern "C" void RendererLogPrintf(const char* fmt, ...);
+extern "C" void InstallVorpalCompatibilityFixes(void);
+extern "C" void UninstallVorpalCompatibilityFixes(void);
+extern "C" void AuditVorpalFixCompanionSettings(void);
 int hook_unprotect(void* ptr, int size, unsigned long* restore);
 int hook_protect(void* ptr, int size, unsigned long restore);
 static void QDECL a1_flashlight_toggle(void);
@@ -151,6 +154,7 @@ static uint32_t r_rmxcoronas = 0;
 
 static HMODULE s_rendererModule = nullptr;
 static HMODULE s_opengl32 = nullptr;
+static bool s_vorpalFixCompanionMode = false;
 
 /* shaderCommands_t field offsets, recovered from the tessellation writers. */
 static const size_t TESS_VERTEXES_OFFSET = 0xAFC80;
@@ -1423,6 +1427,49 @@ int hook_protect(void* ptr, int size, unsigned long restore)
     return TRUE;
 }
 
+/*
+ * Ultimate ASI Loader has no reliable ordering contract.  Presence of the
+ * companion ASI is therefore the opt-in: VorpalFix owns its EXE-level patches
+ * and WhiteRabbit keeps only its renderer-specific hooks.
+ */
+static bool vorpalfix_companion_present()
+{
+    char executablePath[MAX_PATH];
+    char candidate[MAX_PATH];
+    char* lastSlash;
+    static const char* const relativeNames[] = {
+        "VorpalFix.asi",
+        "VorpalFix.dll",
+        "scripts\\VorpalFix.asi",
+        "plugins\\VorpalFix.asi"
+    };
+
+    if (!GetModuleFileNameA(nullptr, executablePath, (DWORD)sizeof(executablePath)))
+        return false;
+
+    lastSlash = strrchr(executablePath, '\\');
+    if (!lastSlash)
+        return false;
+    lastSlash[1] = '\0';
+
+    for (size_t i = 0; i < _countof(relativeNames); ++i)
+    {
+        if (_snprintf_s(candidate, sizeof(candidate), _TRUNCATE, "%s%s",
+                        executablePath, relativeNames[i]) < 0)
+            continue;
+
+        const DWORD attributes = GetFileAttributesA(candidate);
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            RendererLogPrintf("VorpalFix companion mode active (%s)\n", candidate);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void install_getrefapi()
 {
     //0040a145: e8 f6 50 06 00
@@ -2162,6 +2209,15 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         s_rendererModule = hModule;
         s_opengl32 = LoadLibrary("opengl32");
         logInit();
+        s_vorpalFixCompanionMode = vorpalfix_companion_present();
+        if (s_vorpalFixCompanionMode)
+        {
+            AuditVorpalFixCompanionSettings();
+        }
+        else
+        {
+            InstallVorpalCompatibilityFixes();
+        }
         rmx_interface_init(s_opengl32);
         configure_tess_array_addresses();
         install_load_world_map_hook();
@@ -2169,9 +2225,12 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_rmx_dynamic_light_hooks();
         install_rmx_camera_hook();
         install_static_surface_normal_hooks();
-        install_sepia_screenshot_fix();
-        install_console_fix();
-        patch_running_from_alice2();
+        if (!s_vorpalFixCompanionMode)
+        {
+            install_sepia_screenshot_fix();
+            install_console_fix();
+            patch_running_from_alice2();
+        }
         install_sky_portal_trace();
         install_sky_portal_novis_fix();
         install_glw_getvalidmodes();
@@ -2181,6 +2240,8 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_getrefapi();
         break;
     case DLL_PROCESS_DETACH:
+        if (!s_vorpalFixCompanionMode)
+            UninstallVorpalCompatibilityFixes();
         uninstall_static_surface_normal_hooks();
         uninstall_rmx_camera_hook();
         uninstall_rmx_dynamic_light_hooks();
@@ -2193,9 +2254,12 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         uninstall_getrefapi();
         uninstall_sky_portal_novis_fix();
         uninstall_sky_portal_trace();
-        uninstall_runningfromalice2();
-        uninstall_console_fix();
-        uninstall_sepia_screenshot_fix();
+        if (!s_vorpalFixCompanionMode)
+        {
+            uninstall_runningfromalice2();
+            uninstall_console_fix();
+            uninstall_sepia_screenshot_fix();
+        }
         logClose();
         if(s_opengl32) FreeLibrary(s_opengl32);
         s_opengl32 = nullptr;

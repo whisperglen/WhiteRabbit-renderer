@@ -7,4 +7,5 @@ copy .\Release\winmm.dll .\Release\package\
 copy .\resources\bridge.conf .\Release\package\.trex\
 copy .\resources\autoexec.cfg .\Release\package\base\
 copy .\resources\alice_customise.ini .\Release\package\
+copy .\resources\VorpalFix.ini .\Release\package\
 7z a -tzip whiterabbit-renderer.zip .\Release\package\*

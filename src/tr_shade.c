@@ -21,6 +21,10 @@
 #define BUNDLE_NUM_TEXMODS_OFFSET             0x1c
 #define BUNDLE_TEXMODS_OFFSET                 0x20
 
+/* Verified in Alice's linked tr_shade.obj, shaderCommands_t (tess). */
+#define TESS_SHADER_OFFSET                     0x317040
+#define TESS_XSTAGES_OFFSET                    0x317060
+
 #define GL_MATRIX_MODE                        0x0ba0
 #define GL_TEXTURE                            0x1702
 #define GL_TEXTURE0_ARB                       0x84c0
@@ -48,6 +52,8 @@
 #define TMOD_STRETCH                          5
 #define TMOD_ROTATE                           6
 #define TMOD_OFFSET                           9
+
+#define GLS_DEPTHMASK_TRUE                    0x00000100U
 
 /* Alice cvar_t::value is +0x1c and ::integer is +0x20. */
 typedef struct renderer_cvar_s {
@@ -149,6 +155,18 @@ static int read_int(const void* address)
 }
 
 static void write_int(void* address, int value)
+{
+    memcpy(address, &value, sizeof(value));
+}
+
+static unsigned int read_uint(const void* address)
+{
+    unsigned int value;
+    memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+static void write_uint(void* address, unsigned int value)
 {
     memcpy(address, &value, sizeof(value));
 }
@@ -383,6 +401,7 @@ static int should_neutralize_stage_rgb(int rgbGen, int alphaGen)
 
 extern refimport_t ri;
 extern void RendererLogPrintf(const char* fmt, ...);
+extern uint8_t tess;
 
 void RendererInitRemixShaderOptions(void)
 {
@@ -400,7 +419,7 @@ void RendererInitRemixShaderOptions(void)
             "r_environmentMapping", "1", CVAR_ARCHIVE);
     if (!s_gpuUvTransform)
         s_gpuUvTransform = (renderer_cvar_t*)ri.Cvar_Get(
-            "r_gpu_uv_transform", "0", CVAR_ARCHIVE);
+            "r_gpu_uv_transform", "1", CVAR_ARCHIVE);
     if (!s_turbulentScale)
         s_turbulentScale = (renderer_cvar_t*)ri.Cvar_Get(
             "r_turbulentScale", "0.05", CVAR_ARCHIVE);
@@ -657,6 +676,8 @@ void __cdecl RemixTransformTexCoordsHook(const void* modifier, float* destinatio
 
 void __cdecl RemixStageIteratorGenericHook(void)
 {
+    //uint8_t* shader = *(uint8_t**)((uint8_t*)&tess + TESS_SHADER_OFFSET);
+
     if (s_originalStageIteratorGeneric)
         s_originalStageIteratorGeneric();
 
