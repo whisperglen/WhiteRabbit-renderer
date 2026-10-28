@@ -129,6 +129,8 @@ extern "C" void RendererLogPrintf(const char* fmt, ...);
 extern "C" void InstallVorpalCompatibilityFixes(void);
 extern "C" void UninstallVorpalCompatibilityFixes(void);
 extern "C" void AuditVorpalFixCompanionSettings(void);
+extern "C" void InstallFullscreenPersistenceFix(void);
+extern "C" void UninstallFullscreenPersistenceFix(void);
 int hook_unprotect(void* ptr, int size, unsigned long* restore);
 int hook_protect(void* ptr, int size, unsigned long restore);
 static void QDECL a1_flashlight_toggle(void);
@@ -2331,6 +2333,8 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         {
             InstallVorpalCompatibilityFixes();
         }
+        /* VorpalFix.ini disables Vorpal's duplicate in companion mode. */
+        InstallFullscreenPersistenceFix();
         rmx_interface_init(s_opengl32);
         configure_tess_array_addresses();
         install_load_world_map_hook();
@@ -2354,6 +2358,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_getrefapi();
         break;
     case DLL_PROCESS_DETACH:
+        UninstallFullscreenPersistenceFix();
         if (!s_vorpalFixCompanionMode)
             UninstallVorpalCompatibilityFixes();
         uninstall_static_surface_normal_hooks();

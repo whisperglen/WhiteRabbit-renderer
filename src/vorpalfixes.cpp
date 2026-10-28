@@ -19,11 +19,13 @@ extern "C" void RendererLogPrintf(const char* fmt, ...);
 namespace {
 
 constexpr uintptr_t EXE_GET_SAVE_PATH = 0x00417400;
+constexpr uintptr_t EXE_CVAR_GET = 0x00419910;
 constexpr uintptr_t EXE_FS_FOPEN_FILE_READ = 0x0041A590;
 constexpr uintptr_t EXE_STR_TO_LOWER = 0x004256E0;
 constexpr uintptr_t EXE_DISK_FREE_CALL = 0x0042A5CE;
 constexpr uintptr_t EXE_CL_PARSE_PACKET_ENTITIES = 0x0040C1B0;
 constexpr uintptr_t EXE_CL_DRAW_3D_MODEL = 0x00446050;
+constexpr uintptr_t EXE_ALICE_CONSOLE_PTR = 0x007CCA54;
 constexpr uintptr_t EXE_RENDER_WIDTH = 0x011C02CC;
 constexpr uintptr_t EXE_RENDER_HEIGHT = 0x011C02D0;
 
@@ -39,6 +41,7 @@ extern "C" void __cdecl R_DrawString(void* font, char* text, float x, float y,
                                       float heightScale, int maxChars);
 
 typedef char* (__cdecl* GetSavePathFn)();
+typedef void* (__cdecl* CvarGetFn)(const char* name, const char* value, int flags);
 typedef int (__cdecl* FSFOpenFileReadFn)(char*, int*, int, int);
 typedef BYTE (__cdecl* StrToLowerFn)(char*);
 typedef void (__cdecl* CLParsePacketEntitiesFn)(int, int, int);
@@ -52,6 +55,7 @@ typedef void (__cdecl* RDrawStringFn)(void*, char*, float, float, float, float,
                                       float, float, float, int);
 
 static GetSavePathFn s_getSavePath = reinterpret_cast<GetSavePathFn>(EXE_GET_SAVE_PATH);
+static CvarGetFn s_originalCvarGet = reinterpret_cast<CvarGetFn>(EXE_CVAR_GET);
 static FSFOpenFileReadFn s_originalFSFOpenFileRead =
     reinterpret_cast<FSFOpenFileReadFn>(EXE_FS_FOPEN_FILE_READ);
 static StrToLowerFn s_originalStrToLower = reinterpret_cast<StrToLowerFn>(EXE_STR_TO_LOWER);
@@ -65,6 +69,8 @@ static RDrawStringFn s_originalRDrawString = R_DrawString;
 
 static bool s_diskFreePatched = false;
 static BYTE s_originalDiskFreeCall[5] = {};
+static bool s_fullscreenCvarHooked = false;
+static bool s_defaultFullscreenCvarSkipped = false;
 static bool s_strToLowerHooked = false;
 static bool s_pak5Hooked = false;
 static bool s_widescreenHooksInstalled = false;
@@ -141,6 +147,55 @@ static bool commit_detour(bool attach, PVOID* target, PVOID hook, const char* na
         RendererLogPrintf("WARN: %s %s failed: %ld\n", attach ? "installing" : "removing",
                           name, status);
     return status == NO_ERROR;
+}
+
+/*
+ * Alice's base startup settings create r_fullscreen once before the user's
+ * archived setting is consumed.  That instance wins the later registration
+ * and the game subsequently writes its windowed value back to config.cfg.
+ *
+ * This is deliberately the same narrow policy as VorpalFix: discard only the
+ * first r_fullscreen Cvar_Get during startup.  The renderer's later Cvar_Get
+ * creates/uses the real archived-and-latched cvar as normal.
+ */
+static void* __cdecl cvar_get_fullscreen_persistence_hook(const char* name,
+                                                           const char* value,
+                                                           int flags)
+{
+    if (!s_defaultFullscreenCvarSkipped && name &&
+        _stricmp(name, "r_fullscreen") == 0)
+    {
+        s_defaultFullscreenCvarSkipped = true;
+        RendererLogPrintf("Fullscreen persistence: skipped Alice base r_fullscreen default\n");
+        return nullptr;
+    }
+
+    return s_originalCvarGet(name, value, flags);
+}
+
+static void install_fullscreen_persistence_fix()
+{
+    if (s_fullscreenCvarHooked)
+        return;
+
+    if (commit_detour(true, reinterpret_cast<PVOID*>(&s_originalCvarGet),
+                      reinterpret_cast<PVOID>(cvar_get_fullscreen_persistence_hook),
+                      "FixFullscreenSetting"))
+    {
+        s_fullscreenCvarHooked = true;
+        RendererLogPrintf("Fullscreen persistence fix installed\n");
+    }
+}
+
+static void uninstall_fullscreen_persistence_fix()
+{
+    if (!s_fullscreenCvarHooked)
+        return;
+
+    commit_detour(false, reinterpret_cast<PVOID*>(&s_originalCvarGet),
+                  reinterpret_cast<PVOID>(cvar_get_fullscreen_persistence_hook),
+                  "FixFullscreenSetting");
+    s_fullscreenCvarHooked = false;
 }
 
 static int __cdecl check_disk_free_space()
@@ -253,6 +308,18 @@ static WidescreenMetrics get_widescreen_metrics()
     return metrics;
 }
 
+/*
+ * The developer console is an EXE-side UI widget.  Its panel, scissor and
+ * input geometry intentionally occupy the physical output width; they do not
+ * pass through Draw_StretchPic.  Its text must therefore retain that same
+ * coordinate system instead of using the menu's centred 4:3 transform.
+ */
+static bool alice_console_is_open()
+{
+    const uint8_t* const console = *reinterpret_cast<uint8_t* const*>(EXE_ALICE_CONSOLE_PTR);
+    return console && console[0xCC] != 0;
+}
+
 /* Unstretch HUD models and preserve their original left/centre/right placement. */
 static int __cdecl cl_draw_3d_model_widescreen_hook(
     float x, float y, float width, float height, int a5, float* a6, float* a7,
@@ -296,7 +363,7 @@ static void __cdecl r_draw_string_widescreen_hook(void* font, char* text, float 
                                                    float heightScale, int maxChars)
 {
     const WidescreenMetrics metrics = get_widescreen_metrics();
-    if (metrics.widerThanFourByThree) {
+    if (metrics.widerThanFourByThree && !alice_console_is_open()) {
         x = x * metrics.scaleFactor + metrics.widthDifference;
         characterSpacing *= metrics.scaleFactor;
         widthScale *= metrics.scaleFactor;
@@ -588,4 +655,19 @@ extern "C" void UninstallVorpalCompatibilityFixes(void)
 extern "C" void AuditVorpalFixCompanionSettings(void)
 {
     audit_vorpal_companion_ini();
+}
+
+/*
+ * Unlike the general EXE compatibility bundle, this must also remain active
+ * in companion mode.  VorpalFix.ini keeps FixFullscreenSetting = 0 there so
+ * VorpalFix does not install its duplicate hook.
+ */
+extern "C" void InstallFullscreenPersistenceFix(void)
+{
+    install_fullscreen_persistence_fix();
+}
+
+extern "C" void UninstallFullscreenPersistenceFix(void)
+{
+    uninstall_fullscreen_persistence_fix();
 }
