@@ -39,6 +39,7 @@ extern "C" void RB_BeginSurface(void* shader, void* fog);
 extern "C" void RB_SurfaceFace(void* surface);
 extern "C" void RB_SurfaceGrid(void* surface);
 extern "C" void RB_SurfaceTriangles(void* surface);
+extern "C" void R_AddDrawSurf(void* surface, void* shader, int fogNum, int dlightMap);
 extern "C" void RendererInitSkyPortalOptions(void);
 extern "C" void RendererInitRemixShaderOptions(void);
 extern "C" void __cdecl RemixComputeColorsHook(void* stage);
@@ -152,6 +153,28 @@ static cvar_t* r_rmx_dynamiclight = nullptr;
 static uint32_t r_rmxdlights = 0;
 static uint32_t r_rmxcoronas = 0;
 
+/*
+ * R_AddTikiSurfaces writes a 12-byte type-11 record into its 2,048-entry
+ * tess_surfaces ring, then queues a pointer to that record.  Snapshot the
+ * record at queue time so a later ring reuse cannot change an already queued
+ * TIKI draw before the back end consumes it.
+ */
+static const uint32_t MAX_TIKI_SURFACE_SNAPSHOTS = 16384;
+typedef struct tiki_surface_snapshot_s {
+    uint32_t surfaceType;
+    void* tikiMesh;
+    void* oldFrame;
+} tiki_surface_snapshot_t;
+static_assert(sizeof(tiki_surface_snapshot_t) == 12,
+              "Alice TIKI draw-surface records are 12 bytes");
+typedef void (__cdecl *RAddDrawSurfFn)(void* surface, void* shader,
+                                       int fogNum, int dlightMap);
+static RAddDrawSurfFn s_originalRAddDrawSurf = R_AddDrawSurf;
+static tiki_surface_snapshot_t s_tikiSurfaceSnapshots[MAX_TIKI_SURFACE_SNAPSHOTS] = {};
+static uint32_t s_tikiSurfaceSnapshotCount = 0;
+static bool s_tikiSurfaceSnapshotOverflowLogged = false;
+static bool s_tikiSurfaceSnapshotHookInstalled = false;
+
 static HMODULE s_rendererModule = nullptr;
 static HMODULE s_opengl32 = nullptr;
 static bool s_vorpalFixCompanionMode = false;
@@ -164,7 +187,7 @@ static void configure_tess_array_addresses()
 {
     void* ptrs[] = { tess + TESS_VERTEXES_OFFSET, tess + TESS_NORMALS_OFFSET };
 
-    RendererLogPrintf("Remix tess arrays: tess.vertexes=%p, tess.normal=%p (normal delta +0x%X)\n",
+    RendererLogPrintf("Tess array pointers: tess.vertexes=%p, tess.normal=%p (normal delta +0x%X)\n",
                       ptrs[0], ptrs[1],
                       (unsigned int)(TESS_NORMALS_OFFSET - TESS_VERTEXES_OFFSET));
 
@@ -569,6 +592,8 @@ static void __cdecl RE_BeginFrame_RmxHook(int stereoFrame)
     r_rmxdlights = 0;
     r_rmxcoronas = 0;
     s_uiMarkerEmittedThisFrame = false;
+    s_tikiSurfaceSnapshotCount = 0;
+    s_tikiSurfaceSnapshotOverflowLogged = false;
 
     if (r_rmx_dynamiclight && r_rmx_dynamiclight->modified)
     {
@@ -583,6 +608,94 @@ static void __cdecl RE_BeginFrame_RmxHook(int stereoFrame)
     }
 
     s_originalREBeginFrame(stereoFrame);
+}
+
+static void __cdecl R_AddDrawSurf_TikiSnapshotHook(void* surface, void* shader,
+                                                    int fogNum, int dlightMap)
+{
+    uint32_t surfaceType = 0;
+
+    if (surface)
+        memcpy(&surfaceType, surface, sizeof(surfaceType));
+
+    if (surfaceType == 0x0b)
+    {
+        if (s_tikiSurfaceSnapshotCount < MAX_TIKI_SURFACE_SNAPSHOTS)
+        {
+            tiki_surface_snapshot_t* snapshot =
+                &s_tikiSurfaceSnapshots[s_tikiSurfaceSnapshotCount++];
+
+            memcpy(snapshot, surface, sizeof(*snapshot));
+            surface = snapshot;
+        }
+        else if (!s_tikiSurfaceSnapshotOverflowLogged)
+        {
+            RendererLogPrintf("WARN: TIKI surface snapshot pool exhausted\n");
+            s_tikiSurfaceSnapshotOverflowLogged = true;
+        }
+    }
+
+    s_originalRAddDrawSurf(surface, shader, fogNum, dlightMap);
+}
+
+static void install_tiki_surface_snapshot_hook()
+{
+    LONG status;
+
+    if (s_tikiSurfaceSnapshotHookInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRAddDrawSurf,
+                              R_AddDrawSurf_TikiSnapshotHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        s_tikiSurfaceSnapshotHookInstalled = true;
+        RendererLogPrintf("Stable TIKI draw-surface snapshots installed (%u records/frame)\n",
+                          MAX_TIKI_SURFACE_SNAPSHOTS);
+    }
+    else
+    {
+        s_originalRAddDrawSurf = R_AddDrawSurf;
+        RendererLogPrintf("WARN: failed to install stable TIKI draw-surface snapshots: %ld\n",
+                          status);
+    }
+}
+
+static void uninstall_tiki_surface_snapshot_hook()
+{
+    LONG status;
+
+    if (!s_tikiSurfaceSnapshotHookInstalled)
+        return;
+
+    status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRAddDrawSurf,
+                              R_AddDrawSurf_TikiSnapshotHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove stable TIKI draw-surface snapshots: %ld\n",
+                          status);
+
+    s_originalRAddDrawSurf = R_AddDrawSurf;
+    s_tikiSurfaceSnapshotCount = 0;
+    s_tikiSurfaceSnapshotOverflowLogged = false;
+    s_tikiSurfaceSnapshotHookInstalled = false;
 }
 
 static void install_rmx_dynamic_light_hooks()
@@ -2223,6 +2336,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_load_world_map_hook();
         install_flashlight_command_hooks();
         install_rmx_dynamic_light_hooks();
+        install_tiki_surface_snapshot_hook();
         install_rmx_camera_hook();
         install_static_surface_normal_hooks();
         if (!s_vorpalFixCompanionMode)
@@ -2244,6 +2358,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
             UninstallVorpalCompatibilityFixes();
         uninstall_static_surface_normal_hooks();
         uninstall_rmx_camera_hook();
+        uninstall_tiki_surface_snapshot_hook();
         uninstall_rmx_dynamic_light_hooks();
         uninstall_flashlight_command_hooks();
         uninstall_load_world_map_hook();

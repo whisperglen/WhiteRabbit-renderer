@@ -87,3 +87,83 @@ The portal-sky surface itself has no ordinary visible material: Alice diverts
 it to `R_Sky_AddSurf` and obtains its appearance solely from the recursive
 sky-camera render.  Consequently it cannot be globally converted to a normal
 draw surface without removing the level's sky.
+
+## Stable TIKI draw-surface records
+
+Alice submits TIKI-model geometry through `R_AddTikiSurfaces`.  For each
+visible TIKI mesh it builds a small, 12-byte surface record in the renderer's
+`tess_surfaces` scratch ring:
+
+```c
+struct tiki_surface_record {
+    uint32_t type;       // 11 (`SF_TIKI`)
+    void* tikiMesh;
+    void* oldFrame;
+};
+```
+
+The original code advances that ring with a 2,048-entry mask:
+
+```c
+tess_surface_index = (tess_surface_index + 1) & 0x7ff;
+```
+
+It then gives `R_AddDrawSurf` a pointer to the scratch record.  The actual
+surface is consumed later by the back end.  Under some scene workloads a ring
+entry can be reused before its queued draw has been consumed.  The queued draw
+then observes the later record's `tikiMesh` and frame pointers instead of the
+ones it was submitted with.
+
+This appeared as brief, recurring changes to the vertex and UV data of static
+lantern meshes.  It was not a Remix or OpenGL-wrapper buffer issue: the
+renderer had already selected a different TIKI mesh before issuing OpenGL.
+The model handle, animation, and animation-frame state remained unchanged;
+only the queued scratch record changed.
+
+### Fix
+
+`R_AddDrawSurf` is detoured in `_dllmain.cpp`.  When the submitted surface has
+type `11`, the hook copies its 12-byte record into a private 16,384-record
+per-frame pool and passes the stable copy to the original `R_AddDrawSurf`.
+All other surface types are passed through unchanged.
+
+The pool is reset at `RE_BeginFrame`, after the previous frame's back-end work
+has completed.  This preserves the surface data for the lifetime of every
+queued draw while avoiding a change to the original renderer's fixed scratch
+array or its sort path.  A one-time warning is logged if the private pool is
+ever exhausted in a frame.
+
+### Preferred source-level fix
+
+With access to the renderer source, the cleaner solution is to give each
+queued TIKI draw ownership of its transient surface record.  At TIKI
+submission time, copy the record into a frame/command-buffer arena instead of
+passing a pointer into a modulo-wrapped global scratch array:
+
+```c
+void R_AddTikiDrawSurf(const srfTiki_t* source, shader_t* shader,
+                       int fogNum, int dlightMap)
+{
+    srfTiki_t* stable = R_FrameAlloc(sizeof(*stable));
+    *stable = *source;
+
+    R_AddDrawSurf(stable, shader, fogNum, dlightMap);
+}
+```
+
+The allocation arena must be owned by the render-command buffer and kept alive
+until its back end has completed.  In an SMP renderer, use one arena per
+in-flight command buffer/frame slot and recycle it only after the corresponding
+completion fence.  Resetting at an arbitrary frame boundary is only safe when
+the preceding back-end work is known to have finished.
+
+An even more explicit design is for `drawSurf_t` to contain a copy of the
+transient `srfTiki_t` payload (or a typed sidecar index) rather than a pointer
+to mutable scratch memory.  Either approach removes the ownership ambiguity.
+
+The essential constraints are:
+
+- Never overwrite a surface record while a queued draw can still reference it.
+- Do not rely on a modulo-wrapped fixed array for queued transient data.
+- If a bounded arena is retained, detect overflow and grow or fail safely;
+  never silently reuse a live record.
