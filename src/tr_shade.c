@@ -422,7 +422,7 @@ void RendererInitRemixShaderOptions(void)
             "r_gpu_uv_transform", "1", CVAR_ARCHIVE);
     if (!s_turbulentScale)
         s_turbulentScale = (renderer_cvar_t*)ri.Cvar_Get(
-            "r_turbulentScale", "0.05", CVAR_ARCHIVE);
+            "r_turbulentScale", "0.01", CVAR_ARCHIVE);
 
     RendererLogPrintf("Remix shader options: r_novertex_colors=%d, "
                       "r_turbulentTextures=%d, r_environmentMapping=%d, "

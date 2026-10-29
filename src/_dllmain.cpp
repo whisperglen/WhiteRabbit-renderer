@@ -33,9 +33,11 @@ extern "C" void RE_Shutdown(int destroyWindow);
 extern "C" void RE_AddLightToScene(const vec3_t org, float intensity,
                                     float r, float g, float b, int type);
 extern "C" void RE_AddRefEntityToScene(const refEntity_t* ent);
+extern "C" int RE_RegisterModel(const char* name);
 extern "C" void RE_BeginFrame(int stereoFrame);
 extern "C" void RE_RenderScene(const refdef_t* fd);
 extern "C" void RB_BeginSurface(void* shader, void* fog);
+extern "C" void RB_DrawSprite(void* sprite);
 extern "C" void RB_SurfaceFace(void* surface);
 extern "C" void RB_SurfaceGrid(void* surface);
 extern "C" void RB_SurfaceTriangles(void* surface);
@@ -134,6 +136,10 @@ extern "C" void UninstallFullscreenPersistenceFix(void);
 int hook_unprotect(void* ptr, int size, unsigned long* restore);
 int hook_protect(void* ptr, int size, unsigned long restore);
 static void QDECL a1_flashlight_toggle(void);
+static void install_cgame_emitter_bootstrap_patch();
+
+// forward declaration for a same unit static variable :fingers-crossed:
+extern bool s_cgameEmitterCheckDone;
 
 /* Alice cvar_t layout, recovered from R_Register and the renderer ABI. */
 typedef struct cvar_s {
@@ -152,8 +158,18 @@ typedef struct cvar_s {
 static const int CVAR_ARCHIVE = 1;
 static cvar_t* r_rmx_coronas = nullptr;
 static cvar_t* r_rmx_dynamiclight = nullptr;
+static cvar_t* r_rmx_patch_entity_spawn = nullptr;
 static uint32_t r_rmxdlights = 0;
 static uint32_t r_rmxcoronas = 0;
+/* Sprite records can be drawn in several views during one frame. */
+struct spark_light_record_t {
+    const void* sprite;
+    vec3_t origin;
+};
+static const uint32_t MAX_SPARK_LIGHT_RECORDS = 4096;
+static spark_light_record_t s_sparkLightRecords[MAX_SPARK_LIGHT_RECORDS];
+static uint32_t s_sparkLightRecordCount = 0;
+static bool s_sparkLightOverflowLogged = false;
 
 /*
  * R_AddTikiSurfaces writes a 12-byte type-11 record into its 2,048-entry
@@ -365,6 +381,8 @@ static void __cdecl RE_LoadWorldMap_RmxHook(const char* mapName)
 {
     rmx_begin_loading_map(mapName);
     s_originalRELoadWorldMap(mapName);
+    install_cgame_emitter_bootstrap_patch();
+    s_cgameEmitterCheckDone = false;
 }
 
 static void install_load_world_map_hook()
@@ -449,6 +467,8 @@ static void __cdecl R_Register_FlashlightCommandHook(void)
             "rmx_coronas", "0", CVAR_ARCHIVE);
         r_rmx_dynamiclight = (cvar_t*)ri.Cvar_Get(
             "rmx_dynamiclight", "1", CVAR_ARCHIVE);
+        r_rmx_patch_entity_spawn = (cvar_t*)ri.Cvar_Get(
+            "rmx_patch_entity_spawn", "1", CVAR_ARCHIVE);
     }
 
     if (!s_flashlightCommandRegistered && ri.Cmd_AddCommand)
@@ -550,11 +570,234 @@ static void uninstall_flashlight_command_hooks()
 typedef void (__cdecl *REAddLightToSceneFn)(const vec3_t org, float intensity,
                                             float r, float g, float b, int type);
 typedef void (__cdecl *REAddRefEntityToSceneFn)(const refEntity_t* ent);
+typedef int (__cdecl *RERegisterModelFn)(const char* name);
 typedef void (__cdecl *REBeginFrameFn)(int stereoFrame);
 static REAddLightToSceneFn s_originalREAddLightToScene = RE_AddLightToScene;
 static REAddRefEntityToSceneFn s_originalREAddRefEntityToScene = RE_AddRefEntityToScene;
+static RERegisterModelFn s_originalRERegisterModel = RE_RegisterModel;
 static REBeginFrameFn s_originalREBeginFrame = RE_BeginFrame;
 static bool s_rmxDynamicLightHooksInstalled = false;
+static const float RMX_SPARK_LIGHT_INTENSITY = 48.0f;
+
+/*
+ * GetEmitTime initializes each new emittertime_t by storing cg.time in
+ * last_emit_time.  That makes every emitter wait one whole spawn interval.
+ * Change that initial store to zero; then, at UpdateEmitter's first-use
+ * branch (EBX is emittertime_t* and ESI is ClientGameCommandManager*),
+ * invoke Alice's normal SpawnTempModel(1, 0) path and retain its timestamp.
+ *
+ * The initializer is shared by emitter types, so this is deliberately global.
+ */
+static const uintptr_t CGAME_EMITTER_FIRST_TIME_RVA = 0x18101;
+static const uintptr_t CGAME_SPAWN_TEMP_MODEL_CALL_RVA = 0x17fa5;
+static const uintptr_t CGAME_EMITTER_TIME_INIT_RVA = 0x11c11;
+static const uint32_t CGAME_LAST_EMIT_OFFSET = 0x10;
+static byte s_originalCGameEmitterFirstTime[9] = {};
+static byte s_originalCGameEmitterTimeInit[8] = {};
+static byte* s_cgameEmitterFirstTimePatch = nullptr;
+static byte* s_cgameEmitterTimeInitPatch = nullptr;
+static uintptr_t s_cgameTimeAddress = 0;
+static uintptr_t s_cgameSpawnTempModel = 0;
+static HMODULE s_cgameEmitterModule = nullptr;
+static bool s_cgameEmitterCheckDone = false;
+static bool s_cgameEmitterBootstrapPatched = false;
+static bool s_cgameEmitterSignatureMismatchLogged = false;
+
+static void __declspec(naked) cgame_emitter_bootstrap_thunk(void)
+{
+    __asm {
+        /* SpawnTempModel(1, 0), matching Alice's normal count==1 path. */
+        push 0
+        push 1
+        mov ecx, esi
+        mov eax, dword ptr [s_cgameSpawnTempModel]
+        test eax, eax
+        jnz call_spawn_temp_model
+        add esp, 8
+        jmp skip_first_spawn
+
+call_spawn_temp_model:
+        call eax
+
+skip_first_spawn:
+        mov ecx, dword ptr [s_cgameTimeAddress]
+        mov ecx, dword ptr [ecx]
+        mov dword ptr [ebx + 0x10], ecx
+        mov eax, dword ptr [s_cgameEmitterFirstTimePatch]
+        add eax, 9
+        jmp eax
+    }
+}
+
+static void install_cgame_emitter_bootstrap_patch()
+{
+    HMODULE cgameModule;
+    byte* firstTime;
+    byte* spawnTempModelCall;
+    byte* timeInit;
+    uint32_t timeAddress;
+    int32_t spawnTempModelDisplacement;
+    intptr_t relativeJump;
+    unsigned long restore;
+
+    if (!r_rmx_patch_entity_spawn || !r_rmx_patch_entity_spawn->value || s_cgameEmitterCheckDone)
+        return;
+
+    cgameModule = GetModuleHandleA("cgamex86.dll");
+    if (!cgameModule)
+        return;
+    
+    s_cgameEmitterCheckDone = true;
+
+    firstTime = reinterpret_cast<byte*>(cgameModule) + CGAME_EMITTER_FIRST_TIME_RVA;
+    spawnTempModelCall = reinterpret_cast<byte*>(cgameModule) +
+                         CGAME_SPAWN_TEMP_MODEL_CALL_RVA;
+    timeInit = reinterpret_cast<byte*>(cgameModule) + CGAME_EMITTER_TIME_INIT_RVA;
+
+    /* cgame can be unloaded and recreated during a map transition. */
+    if (s_cgameEmitterBootstrapPatched && s_cgameEmitterModule == cgameModule &&
+        firstTime[0] == 0xe9 && timeInit[0] == 0xc7 && timeInit[1] == 0x46 &&
+        timeInit[2] == CGAME_LAST_EMIT_OFFSET)
+        return;
+    if (s_cgameEmitterBootstrapPatched && s_cgameEmitterModule != cgameModule)
+    {
+        s_cgameEmitterFirstTimePatch = nullptr;
+        s_cgameEmitterTimeInitPatch = nullptr;
+        s_cgameEmitterModule = nullptr;
+        s_cgameTimeAddress = 0;
+        s_cgameSpawnTempModel = 0;
+        s_cgameEmitterBootstrapPatched = false;
+    }
+
+    /* mov ecx, [cg.time]; mov [ebx + 0x10], ecx */
+    if (firstTime[0] != 0x8b || firstTime[1] != 0x0d ||
+        firstTime[6] != 0x89 || firstTime[7] != 0x4b ||
+        firstTime[8] != CGAME_LAST_EMIT_OFFSET ||
+        /* call ClientGameCommandManager::SpawnTempModel(1, 0) */
+        spawnTempModelCall[0] != 0xe8 ||
+        /* mov eax, [cg.time]; mov [esi + 0x10], eax */
+        timeInit[0] != 0xa1 || timeInit[5] != 0x89 ||
+        timeInit[6] != 0x46 || timeInit[7] != CGAME_LAST_EMIT_OFFSET)
+    {
+        if (!s_cgameEmitterSignatureMismatchLogged)
+        {
+            RendererLogPrintf(
+                "WARN: cgame emitter bootstrap signature mismatch at %p: "
+                "first=%02X %02X %02X %02X %02X %02X %02X %02X %02X, "
+                "spawnCall=%02X %02X %02X %02X %02X, "
+                "init=%p: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                firstTime,
+                firstTime[0], firstTime[1], firstTime[2], firstTime[3], firstTime[4],
+                firstTime[5], firstTime[6], firstTime[7], firstTime[8],
+                spawnTempModelCall[0], spawnTempModelCall[1], spawnTempModelCall[2],
+                spawnTempModelCall[3], spawnTempModelCall[4], timeInit,
+                timeInit[0], timeInit[1], timeInit[2], timeInit[3],
+                timeInit[4], timeInit[5], timeInit[6], timeInit[7]);
+            s_cgameEmitterSignatureMismatchLogged = true;
+        }
+        return;
+    }
+
+    memcpy(&timeAddress, firstTime + 2, sizeof(timeAddress));
+    memcpy(&spawnTempModelDisplacement, spawnTempModelCall + 1,
+           sizeof(spawnTempModelDisplacement));
+    relativeJump = reinterpret_cast<byte*>(cgame_emitter_bootstrap_thunk) -
+                   (firstTime + 5);
+    if ((intptr_t)(int32_t)relativeJump != relativeJump)
+    {
+        RendererLogPrintf("WARN: cgame emitter bootstrap jump is out of range\n");
+        return;
+    }
+
+    s_cgameTimeAddress = timeAddress;
+    s_cgameSpawnTempModel = reinterpret_cast<uintptr_t>(spawnTempModelCall + 5) +
+                            spawnTempModelDisplacement;
+
+    if (!hook_unprotect(timeInit, (int)sizeof(s_originalCGameEmitterTimeInit), &restore))
+        return;
+
+    memcpy(s_originalCGameEmitterTimeInit, timeInit,
+           sizeof(s_originalCGameEmitterTimeInit));
+    /* mov dword ptr [esi + 0x10], 0; nop */
+    timeInit[0] = 0xc7;
+    timeInit[1] = 0x46;
+    timeInit[2] = CGAME_LAST_EMIT_OFFSET;
+    memset(timeInit + 3, 0, 4);
+    timeInit[7] = 0x90;
+    FlushInstructionCache(GetCurrentProcess(), timeInit,
+                          sizeof(s_originalCGameEmitterTimeInit));
+    hook_protect(timeInit, (int)sizeof(s_originalCGameEmitterTimeInit), restore);
+
+    if (!hook_unprotect(firstTime, (int)sizeof(s_originalCGameEmitterFirstTime), &restore))
+    {
+        if (hook_unprotect(timeInit, (int)sizeof(s_originalCGameEmitterTimeInit), &restore))
+        {
+            memcpy(timeInit, s_originalCGameEmitterTimeInit,
+                   sizeof(s_originalCGameEmitterTimeInit));
+            FlushInstructionCache(GetCurrentProcess(), timeInit,
+                                  sizeof(s_originalCGameEmitterTimeInit));
+            hook_protect(timeInit, (int)sizeof(s_originalCGameEmitterTimeInit), restore);
+        }
+        return;
+    }
+
+    memcpy(s_originalCGameEmitterFirstTime, firstTime,
+           sizeof(s_originalCGameEmitterFirstTime));
+    firstTime[0] = 0xe9;
+    {
+        const int32_t jump = (int32_t)relativeJump;
+        memcpy(firstTime + 1, &jump, sizeof(jump));
+    }
+    memset(firstTime + 5, 0x90, sizeof(s_originalCGameEmitterFirstTime) - 5);
+    FlushInstructionCache(GetCurrentProcess(), firstTime,
+                          sizeof(s_originalCGameEmitterFirstTime));
+    hook_protect(firstTime, (int)sizeof(s_originalCGameEmitterFirstTime), restore);
+
+    s_cgameEmitterFirstTimePatch = firstTime;
+    s_cgameEmitterTimeInitPatch = timeInit;
+    s_cgameEmitterModule = cgameModule;
+    s_cgameEmitterBootstrapPatched = true;
+    RendererLogPrintf("cgame immediate emitter first-spawn patch installed: init=%p, spawn=%p\n",
+                      timeInit, firstTime);
+}
+
+static void uninstall_cgame_emitter_bootstrap_patch()
+{
+    unsigned long restore;
+    HMODULE cgameModule = GetModuleHandleA("cgamex86.dll");
+
+    /* Alice may unload cgamex86.dll before the renderer DLL detaches. */
+    if (s_cgameEmitterFirstTimePatch && cgameModule == s_cgameEmitterModule &&
+        hook_unprotect(s_cgameEmitterFirstTimePatch,
+                       (int)sizeof(s_originalCGameEmitterFirstTime), &restore))
+    {
+        memcpy(s_cgameEmitterFirstTimePatch, s_originalCGameEmitterFirstTime,
+               sizeof(s_originalCGameEmitterFirstTime));
+        FlushInstructionCache(GetCurrentProcess(), s_cgameEmitterFirstTimePatch,
+                              sizeof(s_originalCGameEmitterFirstTime));
+        hook_protect(s_cgameEmitterFirstTimePatch,
+                     (int)sizeof(s_originalCGameEmitterFirstTime), restore);
+    }
+
+    if (s_cgameEmitterTimeInitPatch && cgameModule &&
+        hook_unprotect(s_cgameEmitterTimeInitPatch,
+                       (int)sizeof(s_originalCGameEmitterTimeInit), &restore))
+    {
+        memcpy(s_cgameEmitterTimeInitPatch, s_originalCGameEmitterTimeInit,
+               sizeof(s_originalCGameEmitterTimeInit));
+        FlushInstructionCache(GetCurrentProcess(), s_cgameEmitterTimeInitPatch,
+                              sizeof(s_originalCGameEmitterTimeInit));
+        hook_protect(s_cgameEmitterTimeInitPatch,
+                     (int)sizeof(s_originalCGameEmitterTimeInit), restore);
+    }
+
+    s_cgameEmitterFirstTimePatch = nullptr;
+    s_cgameEmitterTimeInitPatch = nullptr;
+    s_cgameTimeAddress = 0;
+    s_cgameSpawnTempModel = 0;
+    s_cgameEmitterModule = nullptr;
+    s_cgameEmitterBootstrapPatched = false;
+}
 
 static void __cdecl RE_AddLightToScene_RmxHook(const vec3_t org, float intensity,
                                                 float r, float g, float b, int type)
@@ -589,8 +832,16 @@ static void __cdecl RE_AddRefEntityToScene_RmxCoronaHook(const refEntity_t* ent)
     s_originalREAddRefEntityToScene(ent);
 }
 
+
 static void __cdecl RE_BeginFrame_RmxHook(int stereoFrame)
 {
+    s_sparkLightRecordCount = 0;
+    s_sparkLightOverflowLogged = false;
+
+    if (r_rmx_patch_entity_spawn && r_rmx_patch_entity_spawn->value)
+        install_cgame_emitter_bootstrap_patch();
+    else if (s_cgameEmitterBootstrapPatched)
+        uninstall_cgame_emitter_bootstrap_patch();
     r_rmxdlights = 0;
     r_rmxcoronas = 0;
     s_uiMarkerEmittedThisFrame = false;
@@ -772,6 +1023,7 @@ static void uninstall_rmx_dynamic_light_hooks()
     s_originalREBeginFrame = RE_BeginFrame;
     r_rmx_coronas = nullptr;
     r_rmx_dynamiclight = nullptr;
+    r_rmx_patch_entity_spawn = nullptr;
     r_rmxdlights = 0;
     r_rmxcoronas = 0;
     s_rmxDynamicLightHooksInstalled = false;
@@ -875,6 +1127,88 @@ static RBSurfaceFn s_originalRBSurfaceTriangles = RB_SurfaceTriangles;
 static void* s_activeTessShader = nullptr;
 static bool s_staticSurfaceNormalHooksInstalled = false;
 static const size_t SHADER_NEEDS_NORMAL_OFFSET = 0xbc;
+typedef void (__cdecl *RBDrawSpriteFn)(void* sprite);
+static RBDrawSpriteFn s_originalRBDrawSprite = RB_DrawSprite;
+static bool s_sparkLightHookInstalled = false;
+
+static void __cdecl RB_DrawSprite_RmxSparkLightHook(void* sprite)
+{
+    if (sprite && r_rmx_dynamiclight && r_rmx_dynamiclight->value &&
+        s_activeTessShader &&
+        _stricmp(reinterpret_cast<const char*>(s_activeTessShader), "sparkparticle") == 0)
+    {
+        /* refSprite_t::origin, copied from the submitted refEntity_t. */
+        const float* origin = reinterpret_cast<const float*>(
+            reinterpret_cast<const byte*>(sprite) + 0x0c);
+        bool alreadyEmitted = false;
+        for (uint32_t i = 0; i < s_sparkLightRecordCount; ++i)
+        {
+            if (s_sparkLightRecords[i].sprite == sprite &&
+                memcmp(s_sparkLightRecords[i].origin, origin, sizeof(vec3_t)) == 0)
+            {
+                alreadyEmitted = true;
+                break;
+            }
+        }
+
+        if (!alreadyEmitted && s_sparkLightRecordCount < MAX_SPARK_LIGHT_RECORDS)
+        {
+            spark_light_record_t* record = &s_sparkLightRecords[s_sparkLightRecordCount++];
+            record->sprite = sprite;
+            memcpy(record->origin, origin, sizeof(vec3_t));
+            vec3_t color = { 1.0f, 0.75f, 0.20f };
+            rmx_light_add(LIGHT_DYNAMIC, (int)r_rmxdlights,
+                          origin, origin, color, RMX_SPARK_LIGHT_INTENSITY);
+            ++r_rmxdlights;
+        }
+        else if (!alreadyEmitted && !s_sparkLightOverflowLogged)
+        {
+            RendererLogPrintf("WARN: spark light per-frame record limit reached\n");
+            s_sparkLightOverflowLogged = true;
+        }
+    }
+
+    s_originalRBDrawSprite(sprite);
+}
+
+static void install_spark_light_hook()
+{
+    LONG status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRBDrawSprite, RB_DrawSprite_RmxSparkLightHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+    if (status == NO_ERROR)
+        s_sparkLightHookInstalled = true;
+    else
+    {
+        s_originalRBDrawSprite = RB_DrawSprite;
+        RendererLogPrintf("WARN: failed to install spark light hook: %ld\n", status);
+    }
+}
+
+static void uninstall_spark_light_hook()
+{
+    if (!s_sparkLightHookInstalled)
+        return;
+    LONG status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRBDrawSprite, RB_DrawSprite_RmxSparkLightHook);
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+    if (status != NO_ERROR)
+        RendererLogPrintf("WARN: failed to remove spark light hook: %ld\n", status);
+    s_originalRBDrawSprite = RB_DrawSprite;
+    s_sparkLightHookInstalled = false;
+}
 
 static void __cdecl RB_BeginSurface_NormalCaptureHook(void* shader, void* fog)
 {
@@ -2340,9 +2674,11 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         install_load_world_map_hook();
         install_flashlight_command_hooks();
         install_rmx_dynamic_light_hooks();
+        install_cgame_emitter_bootstrap_patch();
         install_tiki_surface_snapshot_hook();
         install_rmx_camera_hook();
         install_static_surface_normal_hooks();
+        install_spark_light_hook();
         if (!s_vorpalFixCompanionMode)
         {
             install_sepia_screenshot_fix();
@@ -2361,9 +2697,11 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD ul_reason_for_call, LPVOID )
         UninstallFullscreenPersistenceFix();
         if (!s_vorpalFixCompanionMode)
             UninstallVorpalCompatibilityFixes();
+        uninstall_spark_light_hook();
         uninstall_static_surface_normal_hooks();
         uninstall_rmx_camera_hook();
         uninstall_tiki_surface_snapshot_hook();
+        uninstall_cgame_emitter_bootstrap_patch();
         uninstall_rmx_dynamic_light_hooks();
         uninstall_flashlight_command_hooks();
         uninstall_load_world_map_hook();
