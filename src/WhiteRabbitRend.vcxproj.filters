@@ -26,6 +26,9 @@
     <ClCompile Include="missing.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="normal_smoothing.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="trouble.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -53,6 +56,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="qtypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="normal_smoothing.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="str.h">

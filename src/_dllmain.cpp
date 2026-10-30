@@ -8,6 +8,7 @@
 #include <intrin.h>
 #include <detours.h>
 #include "alice_renderer_api.h"
+#include "normal_smoothing.h"
 #define RMX_ADD_IMPL
 #include "qindie_rmx.h"
 
@@ -37,6 +38,7 @@ extern "C" int RE_RegisterModel(const char* name);
 extern "C" void RE_BeginFrame(int stereoFrame);
 extern "C" void RE_RenderScene(const refdef_t* fd);
 extern "C" void RB_BeginSurface(void* shader, void* fog);
+extern "C" void RB_EndSurface(void);
 extern "C" void RB_DrawSprite(void* sprite);
 extern "C" void RB_SurfaceFace(void* surface);
 extern "C" void RB_SurfaceGrid(void* surface);
@@ -159,6 +161,9 @@ static const int CVAR_ARCHIVE = 1;
 static cvar_t* r_rmx_coronas = nullptr;
 static cvar_t* r_rmx_dynamiclight = nullptr;
 static cvar_t* r_rmx_patch_entity_spawn = nullptr;
+static cvar_t* rmx_surface_normal_debug = nullptr;
+static cvar_t* rmx_smooth_face_normals = nullptr;
+static cvar_t* rmx_normal_smoothing_mode = nullptr;
 static uint32_t r_rmxdlights = 0;
 static uint32_t r_rmxcoronas = 0;
 /* Sprite records can be drawn in several views during one frame. */
@@ -200,6 +205,8 @@ static bool s_vorpalFixCompanionMode = false;
 /* shaderCommands_t field offsets, recovered from the tessellation writers. */
 static const size_t TESS_VERTEXES_OFFSET = 0xAFC80;
 static const size_t TESS_NORMALS_OFFSET = 0x124F80;
+static const size_t TESS_NUM_VERTEXES_OFFSET = 0x317054;
+static const size_t TESS_NUM_INDEXES_OFFSET = 0x317050;
 
 static void configure_tess_array_addresses()
 {
@@ -469,6 +476,12 @@ static void __cdecl R_Register_FlashlightCommandHook(void)
             "rmx_dynamiclight", "1", CVAR_ARCHIVE);
         r_rmx_patch_entity_spawn = (cvar_t*)ri.Cvar_Get(
             "rmx_patch_entity_spawn", "1", CVAR_ARCHIVE);
+        rmx_surface_normal_debug = (cvar_t*)ri.Cvar_Get(
+            "rmx_surface_normal_debug", "0", 0);
+        rmx_smooth_face_normals = (cvar_t*)ri.Cvar_Get(
+            "rmx_smooth_face_normals", "1", 0);
+        rmx_normal_smoothing_mode = (cvar_t*)ri.Cvar_Get(
+            "rmx_normal_smoothing_mode", "1", 0);
     }
 
     if (!s_flashlightCommandRegistered && ri.Cmd_AddCommand)
@@ -1024,6 +1037,9 @@ static void uninstall_rmx_dynamic_light_hooks()
     r_rmx_coronas = nullptr;
     r_rmx_dynamiclight = nullptr;
     r_rmx_patch_entity_spawn = nullptr;
+    rmx_surface_normal_debug = nullptr;
+    rmx_smooth_face_normals = nullptr;
+    rmx_normal_smoothing_mode = nullptr;
     r_rmxdlights = 0;
     r_rmxcoronas = 0;
     s_rmxDynamicLightHooksInstalled = false;
@@ -1119,14 +1135,18 @@ static void uninstall_rmx_camera_hook()
  * while those static-surface handlers execute.
  */
 typedef void (__cdecl *RBBeginSurfaceFn)(void* shader, void* fog);
+typedef void (__cdecl *RBEndSurfaceFn)(void);
 typedef void (__cdecl *RBSurfaceFn)(void* surface);
 static RBBeginSurfaceFn s_originalRBBeginSurface = RB_BeginSurface;
+static RBEndSurfaceFn s_originalRBEndSurface = RB_EndSurface;
 static RBSurfaceFn s_originalRBSurfaceFace = RB_SurfaceFace;
 static RBSurfaceFn s_originalRBSurfaceGrid = RB_SurfaceGrid;
 static RBSurfaceFn s_originalRBSurfaceTriangles = RB_SurfaceTriangles;
 static void* s_activeTessShader = nullptr;
+static uint32_t s_tessBatchGeneration = 0;
 static bool s_staticSurfaceNormalHooksInstalled = false;
 static const size_t SHADER_NEEDS_NORMAL_OFFSET = 0xbc;
+
 typedef void (__cdecl *RBDrawSpriteFn)(void* sprite);
 static RBDrawSpriteFn s_originalRBDrawSprite = RB_DrawSprite;
 static bool s_sparkLightHookInstalled = false;
@@ -1213,11 +1233,35 @@ static void uninstall_spark_light_hook()
 static void __cdecl RB_BeginSurface_NormalCaptureHook(void* shader, void* fog)
 {
     s_activeTessShader = shader;
+    ++s_tessBatchGeneration;
+    if (rmx_smooth_face_normals && rmx_smooth_face_normals->integer)
+        NormalSmoothing_Reset();
     s_originalRBBeginSurface(shader, fog);
 }
 
-static void force_static_surface_normals(RBSurfaceFn original, void* surface)
+static void __cdecl RB_EndSurface_SmoothFacesHook(void)
 {
+    if (rmx_smooth_face_normals && rmx_smooth_face_normals->integer &&
+        (!rmx_surface_normal_debug || !rmx_surface_normal_debug->integer))
+        NormalSmoothing_Run(
+            reinterpret_cast<const float*>(tess + TESS_VERTEXES_OFFSET),
+            reinterpret_cast<float*>(tess + TESS_NORMALS_OFFSET),
+            reinterpret_cast<const uint32_t*>(tess),
+            *reinterpret_cast<const int*>(tess + TESS_NUM_VERTEXES_OFFSET),
+            *reinterpret_cast<const int*>(tess + TESS_NUM_INDEXES_OFFSET),
+            rmx_normal_smoothing_mode ? rmx_normal_smoothing_mode->integer : 0);
+    s_originalRBEndSurface();
+}
+
+static void force_static_surface_normals(RBSurfaceFn original, void* surface, int debugType)
+{
+    const bool markNormals = rmx_surface_normal_debug &&
+        rmx_surface_normal_debug->integer == debugType;
+    const bool markSurface = (debugType == 1 || debugType == 2) && rmx_smooth_face_normals &&
+        rmx_smooth_face_normals->integer;
+    const int firstVertex = (markNormals || markSurface)
+        ? *reinterpret_cast<const int*>(tess + TESS_NUM_VERTEXES_OFFSET) : 0;
+    const uint32_t generation = s_tessBatchGeneration;
     int* needsNormal = s_activeTessShader
         ? (int*)((byte*)s_activeTessShader + SHADER_NEEDS_NORMAL_OFFSET)
         : nullptr;
@@ -1228,23 +1272,44 @@ static void force_static_surface_normals(RBSurfaceFn original, void* surface)
 
     original(surface);
 
+    if (markNormals || markSurface)
+    {
+        const int endVertex = *reinterpret_cast<const int*>(tess + TESS_NUM_VERTEXES_OFFSET);
+        const int beginVertex = generation == s_tessBatchGeneration ? firstVertex : 0;
+        if (beginVertex >= 0 && beginVertex <= endVertex && endVertex <= 30000)
+        {
+            if (markSurface)
+                NormalSmoothing_Mark(beginVertex, endVertex);
+            if (markNormals)
+            {
+                float* normals = reinterpret_cast<float*>(tess + TESS_NORMALS_OFFSET);
+                for (int i = beginVertex; i < endVertex; ++i)
+                {
+                    normals[i * 4 + 0] = 1.0f;
+                    normals[i * 4 + 1] = 0.0f;
+                    normals[i * 4 + 2] = 0.0f;
+                }
+            }
+        }
+    }
+
     if (needsNormal)
         *needsNormal = previousNeedsNormal;
 }
 
 static void __cdecl RB_SurfaceFace_NormalHook(void* surface)
 {
-    force_static_surface_normals(s_originalRBSurfaceFace, surface);
+    force_static_surface_normals(s_originalRBSurfaceFace, surface, 1);
 }
 
 static void __cdecl RB_SurfaceGrid_NormalHook(void* surface)
 {
-    force_static_surface_normals(s_originalRBSurfaceGrid, surface);
+    force_static_surface_normals(s_originalRBSurfaceGrid, surface, 3);
 }
 
 static void __cdecl RB_SurfaceTriangles_NormalHook(void* surface)
 {
-    force_static_surface_normals(s_originalRBSurfaceTriangles, surface);
+    force_static_surface_normals(s_originalRBSurfaceTriangles, surface, 2);
 }
 
 static void install_static_surface_normal_hooks()
@@ -1260,6 +1325,9 @@ static void install_static_surface_normal_hooks()
     if (status == NO_ERROR)
         status = DetourAttach((PVOID*)&s_originalRBBeginSurface,
                               RB_BeginSurface_NormalCaptureHook);
+    if (status == NO_ERROR)
+        status = DetourAttach((PVOID*)&s_originalRBEndSurface,
+                              RB_EndSurface_SmoothFacesHook);
     if (status == NO_ERROR)
         status = DetourAttach((PVOID*)&s_originalRBSurfaceFace,
                               RB_SurfaceFace_NormalHook);
@@ -1282,6 +1350,7 @@ static void install_static_surface_normal_hooks()
     else
     {
         s_originalRBBeginSurface = RB_BeginSurface;
+        s_originalRBEndSurface = RB_EndSurface;
         s_originalRBSurfaceFace = RB_SurfaceFace;
         s_originalRBSurfaceGrid = RB_SurfaceGrid;
         s_originalRBSurfaceTriangles = RB_SurfaceTriangles;
@@ -1311,6 +1380,9 @@ static void uninstall_static_surface_normal_hooks()
         status = DetourDetach((PVOID*)&s_originalRBSurfaceFace,
                               RB_SurfaceFace_NormalHook);
     if (status == NO_ERROR)
+        status = DetourDetach((PVOID*)&s_originalRBEndSurface,
+                              RB_EndSurface_SmoothFacesHook);
+    if (status == NO_ERROR)
         status = DetourDetach((PVOID*)&s_originalRBBeginSurface,
                               RB_BeginSurface_NormalCaptureHook);
     if (status == NO_ERROR)
@@ -1323,6 +1395,7 @@ static void uninstall_static_surface_normal_hooks()
                           status);
 
     s_originalRBBeginSurface = RB_BeginSurface;
+    s_originalRBEndSurface = RB_EndSurface;
     s_originalRBSurfaceFace = RB_SurfaceFace;
     s_originalRBSurfaceGrid = RB_SurfaceGrid;
     s_originalRBSurfaceTriangles = RB_SurfaceTriangles;

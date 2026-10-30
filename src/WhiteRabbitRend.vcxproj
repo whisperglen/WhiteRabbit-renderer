@@ -24,6 +24,7 @@
   <ItemGroup>
     <ClCompile Include="globals.c" />
     <ClCompile Include="missing.c" />
+    <ClCompile Include="normal_smoothing.cpp" />
     <ClCompile Include="str.cpp" />
     <ClCompile Include="trouble.c" />
     <ClCompile Include="tr_shade.c" />
@@ -35,6 +36,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="qindie_rmx.h" />
+    <ClInclude Include="normal_smoothing.h" />
     <ClInclude Include="qtypes.h" />
     <ClInclude Include="alice_renderer_api.h" />
     <ClInclude Include="str.h" />
