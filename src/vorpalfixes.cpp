@@ -25,6 +25,9 @@ constexpr uintptr_t EXE_STR_TO_LOWER = 0x004256E0;
 constexpr uintptr_t EXE_DISK_FREE_CALL = 0x0042A5CE;
 constexpr uintptr_t EXE_CL_PARSE_PACKET_ENTITIES = 0x0040C1B0;
 constexpr uintptr_t EXE_CL_DRAW_3D_MODEL = 0x00446050;
+constexpr uintptr_t EXE_UI_WIDGET_DRAW_PIC = 0x004B0AF0;
+constexpr uintptr_t EXE_VTABLE_UI_WINDOW_MANAGER = 0x0053E62C;
+constexpr uintptr_t EXE_VTABLE_UI_LABEL = 0x005410FC;
 constexpr uintptr_t EXE_ALICE_CONSOLE_PTR = 0x007CCA54;
 constexpr uintptr_t EXE_RENDER_WIDTH = 0x011C02CC;
 constexpr uintptr_t EXE_RENDER_HEIGHT = 0x011C02D0;
@@ -35,6 +38,7 @@ extern "C" void __cdecl Draw_StretchPic(float x, float y, float width, float hei
                                          int shader);
 extern "C" void __cdecl RE_StretchRaw(int x, int y, int width, int height,
                                        int columns, int rows, int data);
+extern "C" void* __cdecl R_GetShaderByHandle(int handle);
 extern "C" void __cdecl R_DrawString(void* font, char* text, float x, float y,
                                       float angle, float characterSpacing,
                                       float lineSpacing, float widthScale,
@@ -53,6 +57,8 @@ typedef void (__cdecl* DrawStretchPicFn)(float, float, float, float, float,
 typedef void (__cdecl* REStretchRawFn)(int, int, int, int, int, int, int);
 typedef void (__cdecl* RDrawStringFn)(void*, char*, float, float, float, float,
                                       float, float, float, int);
+typedef int (__thiscall* UIWidgetDrawPicFn)(void*, float, float, float, float,
+                                            float, float, float, float, int);
 
 static GetSavePathFn s_getSavePath = reinterpret_cast<GetSavePathFn>(EXE_GET_SAVE_PATH);
 static CvarGetFn s_originalCvarGet = reinterpret_cast<CvarGetFn>(EXE_CVAR_GET);
@@ -66,6 +72,8 @@ static CLDraw3DModelFn s_originalCLDraw3DModel =
 static DrawStretchPicFn s_originalDrawStretchPic = Draw_StretchPic;
 static REStretchRawFn s_originalREStretchRaw = RE_StretchRaw;
 static RDrawStringFn s_originalRDrawString = R_DrawString;
+static UIWidgetDrawPicFn s_originalUIWidgetDrawPic =
+    reinterpret_cast<UIWidgetDrawPicFn>(EXE_UI_WIDGET_DRAW_PIC);
 
 static bool s_diskFreePatched = false;
 static BYTE s_originalDiskFreeCall[5] = {};
@@ -74,6 +82,9 @@ static bool s_defaultFullscreenCvarSkipped = false;
 static bool s_strToLowerHooked = false;
 static bool s_pak5Hooked = false;
 static bool s_widescreenHooksInstalled = false;
+static bool s_widgetPictureHookInstalled = false;
+static bool s_skipPictureScaling = false;
+static bool s_seenMainMenu = false;
 static float s_lastGameplayFov = 90.0f;
 static bool s_haveLastGameplayFov = false;
 
@@ -320,6 +331,53 @@ static bool alice_console_is_open()
     return console && console[0xCC] != 0;
 }
 
+/* Draw_StretchPic already resolves nonzero handles with this renderer symbol.
+ * shader_t begins with its name; its first stage's first image supplies the
+ * natural dimensions when the caller requests a zero-sized picture. */
+static void* shader_for_picture(int handle)
+{
+    return handle > 0 ? R_GetShaderByHandle(handle) : nullptr;
+}
+
+static void resize_mouse_arrow(void* shader, const WidescreenMetrics& metrics)
+{
+    if (!shader || metrics.width <= 0 || metrics.height <= 0)
+        return;
+    uint8_t* const stage = *reinterpret_cast<uint8_t**>(
+        static_cast<uint8_t*>(shader) + 0x194);
+    if (!stage)
+        return;
+    uint8_t* const image = *reinterpret_cast<uint8_t**>(stage + 8);
+    if (!image)
+        return;
+    const float widthScale = static_cast<float>(metrics.width) / 640.0f;
+    const float heightScale = static_cast<float>(metrics.height) / 480.0f;
+    const float scale = widthScale < heightScale ? widthScale : heightScale;
+    *reinterpret_cast<int*>(image + 0x40) = static_cast<int>(16.0f * scale);
+    *reinterpret_cast<int*>(image + 0x44) = static_cast<int>(32.0f * scale);
+}
+
+/* Match Vorpal's widget-specific exclusions, preserving the enclosing scope
+ * if a widget draws another widget recursively. */
+static int __fastcall ui_widget_draw_pic_widescreen_hook(
+    void* widget, void*, float x, float y, float width, float height,
+    float s1, float t1, float s2, float t2, int shader)
+{
+    const bool previousSkip = s_skipPictureScaling;
+    const uint8_t* const bytes = static_cast<const uint8_t*>(widget);
+    const uintptr_t vtable = *reinterpret_cast<const uintptr_t*>(bytes);
+    bool skip = bytes[0x1c1] != 0 || bytes[0x1c8] != 0;
+    if (vtable == EXE_VTABLE_UI_LABEL)
+        skip = true;
+    else if (vtable == EXE_VTABLE_UI_WINDOW_MANAGER)
+        skip = false;
+    s_skipPictureScaling = previousSkip || skip;
+    const int result = s_originalUIWidgetDrawPic(widget, x, y, width, height,
+                                                  s1, t1, s2, t2, shader);
+    s_skipPictureScaling = previousSkip;
+    return result;
+}
+
 /* Unstretch HUD models and preserve their original left/centre/right placement. */
 static int __cdecl cl_draw_3d_model_widescreen_hook(
     float x, float y, float width, float height, int a5, float* a6, float* a7,
@@ -346,7 +404,52 @@ static void __cdecl draw_stretch_pic_widescreen_hook(float x, float y, float wid
                                                       float height, float s1, float t1,
                                                       float s2, float t2, int shader)
 {
+    if (s_skipPictureScaling) {
+        s_originalDrawStretchPic(x, y, width, height, s1, t1, s2, t2, shader);
+        return;
+    }
     const WidescreenMetrics metrics = get_widescreen_metrics();
+    void* const shaderObject = shader_for_picture(shader);
+    const char* const name = static_cast<const char*>(shaderObject);
+
+    if (name && !s_seenMainMenu) {
+        if (strstr(name, "main")) {
+            s_seenMainMenu = true;
+        } else if (strstr(name, "legalplate")) {
+            if (metrics.width > 1280 && metrics.height > 0) {
+                const float scale = static_cast<float>(metrics.height) / 720.0f;
+                width *= scale;
+                height *= scale;
+                x = (metrics.width - width) * 0.5f;
+                y = (metrics.height - height) * 0.5f;
+            }
+            s_originalDrawStretchPic(x, y, width, height, s1, t1, s2, t2, shader);
+            return;
+        } else if (strcmp(name, "title_bg") == 0 && metrics.width > 0 && metrics.height > 0) {
+            const float widthScale = static_cast<float>(metrics.width) / 1280.0f;
+            const float heightScale = static_cast<float>(metrics.height) / 720.0f;
+            const float scale = widthScale > heightScale ? widthScale : heightScale;
+            width = 1280.0f * scale;
+            height = 720.0f * scale;
+            x = (metrics.width - width) * 0.5f;
+            y = (metrics.height - height) * 0.5f;
+            s_originalDrawStretchPic(x, y, width, height, s1, t1, s2, t2, shader);
+            return;
+        }
+    }
+    if (name && strcmp(name, "gfx/2d/mouse_arrow") == 0) {
+        resize_mouse_arrow(shaderObject, metrics);
+        if (alice_console_is_open()) {
+            s_originalDrawStretchPic(x, y, width, height, s1, t1, s2, t2, shader);
+            return;
+        }
+    }
+    if (name && strcmp(name, "ui/quicksavecam/quicksavecam") == 0) {
+        if (metrics.widerThanFourByThree)
+            width *= metrics.scaleFactor;
+        s_originalDrawStretchPic(x, y, width, height, s1, t1, s2, t2, shader);
+        return;
+    }
     if (metrics.widerThanFourByThree) {
         width *= metrics.scaleFactor;
         x = x * metrics.scaleFactor + metrics.widthDifference;
@@ -414,6 +517,8 @@ static void __cdecl cl_parse_packet_entities_letterbox_hook(int message, int old
 
 static void install_widescreen_and_letterbox_fixes()
 {
+    s_seenMainMenu = false;
+    s_skipPictureScaling = false;
     LONG status = DetourTransactionBegin();
     if (status == NO_ERROR) status = DetourUpdateThread(GetCurrentThread());
     if (status == NO_ERROR) status = DetourAttach(
@@ -436,6 +541,16 @@ static void install_widescreen_and_letterbox_fixes()
     if (status == NO_ERROR) {
         s_widescreenHooksInstalled = true;
         RendererLogPrintf("Menu/HUD/FMV aspect-ratio and cinematic-letterbox fixes installed\n");
+        static const uint8_t expected[] = { 0x80, 0xb9, 0xc8, 0x01, 0x00, 0x00, 0x00 };
+        const uint8_t* const widgetCode = reinterpret_cast<const uint8_t*>(EXE_UI_WIDGET_DRAW_PIC);
+        if (memcmp(widgetCode, expected, sizeof(expected)) != 0) {
+            RendererLogPrintf("WARN: UI widget picture scaling hook skipped: signature mismatch at %p\n", widgetCode);
+        } else if (commit_detour(true, reinterpret_cast<PVOID*>(&s_originalUIWidgetDrawPic),
+                                 reinterpret_cast<PVOID>(ui_widget_draw_pic_widescreen_hook),
+                                 "UI widget picture scaling")) {
+            s_widgetPictureHookInstalled = true;
+            RendererLogPrintf("UI widget picture scaling exceptions installed\n");
+        }
     } else {
         RendererLogPrintf("WARN: installing widescreen/letterbox fixes failed: %ld\n", status);
     }
@@ -445,6 +560,13 @@ static void uninstall_widescreen_and_letterbox_fixes()
 {
     if (!s_widescreenHooksInstalled)
         return;
+
+    if (s_widgetPictureHookInstalled) {
+        if (commit_detour(false, reinterpret_cast<PVOID*>(&s_originalUIWidgetDrawPic),
+                          reinterpret_cast<PVOID>(ui_widget_draw_pic_widescreen_hook),
+                          "UI widget picture scaling"))
+            s_widgetPictureHookInstalled = false;
+    }
 
     LONG status = DetourTransactionBegin();
     if (status == NO_ERROR) status = DetourUpdateThread(GetCurrentThread());
