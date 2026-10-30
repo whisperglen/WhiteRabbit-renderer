@@ -15,4 +15,4 @@ Compile the renderer lib of AMG-A1 HD into a dll
 ### TODOs
 - ~~some animated textures still do not render~~ Fixed: with Turbulence emulation + disabled r_ext_texture_env_add
 - r_novis 1 shows all level geometry, I need to implement the AABB fixes from RTCW
-- may need better normals for some surfaces
+- ~~may need better normals for some surfaces~~ added a best effort smooth normals (disable with rmx_smooth_face_normals; rmx_normal_smoothing_mode has an alternative implementation)
